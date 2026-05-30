@@ -41,7 +41,7 @@ The heat pump exposes several RS-485 ports on the controller these are the ones 
 | COM4 | Touchscreen display (JST connector) | Display stays here, untouched |
 | COM2 | Auxiliary terminal block | ESP32 connects here for read/write |
 
-![Control board overview](../images/control_board.jpeg)
+![Control board overview](images/control_board.jpeg)
 *The CHICO R-SY013-BP control board. The PCB part number is visible near the bottom center. The green screw terminal block (COM2) is at the bottom edge.*
 
 Using separate ports for the ESP32 and the display means **no bus contention**. Both can operate simultaneously and stay in sync.
