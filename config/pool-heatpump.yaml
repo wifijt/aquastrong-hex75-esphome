@@ -1,0 +1,886 @@
+# ============================================================================
+# Aquastrong HEX 75 — ESPHome Modbus integration
+# ----------------------------------------------------------------------------
+# Tested on:
+#   Heat pump:   Aquastrong HEX 75
+#   Controller:  CHICO SMBPRO53 V1.44
+#   PCB:         R-SY013-BP  ← printed on the controller board
+#
+# Likely compatible with other CHICO-based units (Fairland, IPS,
+# Poolsystems, Aquark) — see README for details.
+#
+# Hardware: ESP32-C6 + MAX485 module on COM2 (screw terminal block),
+# leaving COM4 (JST connector) for the OEM display.
+#
+# Temperature units: developed on a unit set to °F. Setpoints and all
+# temperature sensors report in °F natively — no conversion applied.
+# If your unit is set to °C, update unit_of_measurement and setpoint
+# ranges accordingly. See docs/PROTOCOL.md for details.
+# ============================================================================
+
+esphome:
+  name: pool-heatpump
+  friendly_name: Pool Heat Pump
+  project:
+    name: esphome.pool_heatpump
+    version: "1.0.0"
+
+esp32:
+  board: esp32-c6-devkitm-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  baud_rate: 0  # disable UART logging; UART0 used elsewhere if needed
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+web_server:
+  port: 80
+  version: 3
+  local: true
+  include_internal: false
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# ====================================================================
+# UART + Modbus
+# ====================================================================
+# GPIO4 = TX to MAX485 DI, GPIO5 = RX from MAX485 RO
+# HW-519R4 module has auto flow control (no DE/RE pin needed)
+uart:
+  id: mod_uart
+  tx_pin: GPIO4
+  rx_pin: GPIO5
+  baud_rate: 9600
+  stop_bits: 1
+  parity: NONE
+  data_bits: 8
+
+modbus:
+  id: mod_bus
+  uart_id: mod_uart
+  send_wait_time: 250ms
+
+modbus_controller:
+  - id: heatpump
+    address: 0x01
+    modbus_id: mod_bus
+    setup_priority: -10
+    update_interval: 2s
+    command_throttle: 100ms
+
+# ====================================================================
+# Globals: cached register block + pending state tracking
+# ====================================================================
+# Cache of the 9-register block at 0x0300 (needed for FC=10 block writes
+# since we must preserve other fields when modifying one).
+globals:
+  - id: cache_cool_setpoint
+    type: int
+    restore_value: no
+    initial_value: '60'
+  - id: cache_heat_setpoint
+    type: int
+    restore_value: no
+    initial_value: '80'
+  - id: cache_upper_bound
+    type: int
+    restore_value: no
+    initial_value: '104'
+  - id: cache_lower_bound
+    type: int
+    restore_value: no
+    initial_value: '65'
+  - id: cache_mode
+    type: int
+    restore_value: no
+    initial_value: '1'   # 0=Cool, 1=Heat, 8=Auto
+  - id: cache_power
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: cache_energy
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: cache_version
+    type: int
+    restore_value: no
+    initial_value: '59'  # 0x3B
+  - id: cache_auto_setpoint
+    type: int
+    restore_value: no
+    initial_value: '80'
+
+  # Pending request tracking (requested value + timestamp + retry flag)
+  - id: pending_power_value
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: pending_power_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_power_retried
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pending_mode_value
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: pending_mode_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_mode_retried
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pending_cool_setpoint
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: pending_cool_setpoint_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_cool_setpoint_retried
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pending_heat_setpoint
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: pending_heat_setpoint_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_heat_setpoint_retried
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pending_auto_setpoint
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: pending_auto_setpoint_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_auto_setpoint_retried
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pending_energy
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: pending_energy_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_energy_retried
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# ====================================================================
+# Text sensor: last error
+# ====================================================================
+text_sensor:
+  - platform: template
+    name: "Pool Heater Last Error"
+    id: last_error
+    icon: mdi:alert-circle-outline
+    update_interval: never
+
+# ====================================================================
+# Binary sensors: fault bit decode (reg 29 is a bitfield)
+# Baseline = 255 (0xFF) means no faults.
+# Bit 8 (0x100) confirmed = E03 Water Flow Switch Fault (reg 29 = 511)
+# Full OEM fault code table in docs/PROTOCOL.md
+# Other bit mappings TBD — contributions welcome
+# ====================================================================
+binary_sensor:
+  - platform: template
+    name: "Pool Heater Fault Active"
+    id: any_fault
+    device_class: problem
+    icon: mdi:alert
+    lambda: |-
+      if (!id(reg_fault).has_state()) return {};
+      return id(reg_fault).state != 255;
+
+  - platform: template
+    name: "Pool Heater Water Flow Fault"
+    id: water_flow_fault
+    device_class: problem
+    icon: mdi:water-off
+    lambda: |-
+      if (!id(reg_fault).has_state()) return {};
+      uint16_t f = (uint16_t)id(reg_fault).state;
+      return (f & 0x0100) != 0;
+
+  - platform: template
+    name: "Pool Heater Heating Active"
+    id: heating_active
+    device_class: heat
+    icon: mdi:fire
+    lambda: |-
+      if (!id(active_heating).has_state()) return {};
+      return id(active_heating).state > 0;
+
+# ====================================================================
+# Scripts: build & send writes
+# ====================================================================
+script:
+  # ----- Build & send the full 9-register block at 0x0300 -----
+  # Used for: power on/off, cool setpoint, heat setpoint, energy mode
+  # All these require writing the full block to preserve other fields.
+  - id: send_full_block
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint16_t> payload = {
+            (uint16_t)id(cache_cool_setpoint),
+            (uint16_t)id(cache_heat_setpoint),
+            (uint16_t)id(cache_upper_bound),
+            (uint16_t)id(cache_lower_bound),
+            (uint16_t)id(cache_mode),
+            (uint16_t)id(cache_power),
+            0,
+            (uint16_t)id(cache_energy),
+            (uint16_t)id(cache_version)
+          };
+          auto cmd = esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+            id(heatpump), 0x0300, 9, payload);
+          id(heatpump)->queue_command(cmd);
+          ESP_LOGI("pool", "Sent block: C=%d H=%d M=%d P=%d E=%d",
+            id(cache_cool_setpoint), id(cache_heat_setpoint),
+            id(cache_mode), id(cache_power), id(cache_energy));
+
+  # ----- Single-register write to 0x0304 (mode) -----
+  - id: send_mode_write
+    mode: queued
+    then:
+      - lambda: |-
+          auto cmd = esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+            id(heatpump), 0x0304, (uint16_t)id(cache_mode));
+          id(heatpump)->queue_command(cmd);
+          ESP_LOGI("pool", "Sent mode write: 0x%02X", id(cache_mode));
+
+  # ----- Single-register write to 0x030B (Auto setpoint) -----
+  - id: send_auto_setpoint_write
+    mode: queued
+    then:
+      - lambda: |-
+          auto cmd = esphome::modbus_controller::ModbusCommandItem::create_write_single_command(
+            id(heatpump), 0x030B, (uint16_t)id(cache_auto_setpoint));
+          id(heatpump)->queue_command(cmd);
+          ESP_LOGI("pool", "Sent auto setpoint: %d", id(cache_auto_setpoint));
+
+  # ----- Confirmation watcher: runs every 2s after each poll -----
+  # Compares pending requests vs cached (just-read) values.
+  # If match → publish confirmed value to HA entity, clear pending.
+  # If 5s elapsed and not retried → retry once.
+  # If 10s elapsed → write error to text_sensor, clear pending.
+  - id: check_confirmations
+    mode: single
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          std::string err = "";
+
+          // ----- Power confirmation -----
+          if (id(pending_power_value) >= 0) {
+            uint32_t age = now - id(pending_power_ts);
+            if (id(cache_power) == id(pending_power_value)) {
+              id(power_switch).publish_state(id(cache_power) == 1);
+              id(pending_power_value) = -1;
+              id(pending_power_retried) = false;
+            } else if (age > 10000) {
+              char buf[100];
+              snprintf(buf, sizeof(buf),
+                "Power write rejected: requested %d, reads %d",
+                id(pending_power_value), id(cache_power));
+              err = buf;
+              id(pending_power_value) = -1;
+              id(pending_power_retried) = false;
+            } else if (age > 5000 && !id(pending_power_retried)) {
+              id(pending_power_retried) = true;
+              id(send_full_block).execute();
+              ESP_LOGW("pool", "Retrying power write");
+            }
+          } else {
+            // No pending request — sync HA entity to current cache
+            id(power_switch).publish_state(id(cache_power) == 1);
+          }
+
+          // ----- Mode confirmation -----
+          if (id(pending_mode_value) >= 0) {
+            uint32_t age = now - id(pending_mode_ts);
+            if (id(cache_mode) == id(pending_mode_value)) {
+              const char* mode_str = (id(cache_mode)==0) ? "Cool" :
+                                     (id(cache_mode)==1) ? "Heat" : "Auto";
+              id(mode_select).publish_state(mode_str);
+              id(pending_mode_value) = -1;
+              id(pending_mode_retried) = false;
+            } else if (age > 10000) {
+              char buf[100];
+              snprintf(buf, sizeof(buf),
+                "Mode write rejected: requested 0x%02X, reads 0x%02X",
+                id(pending_mode_value), id(cache_mode));
+              err = buf;
+              id(pending_mode_value) = -1;
+              id(pending_mode_retried) = false;
+            } else if (age > 5000 && !id(pending_mode_retried)) {
+              id(pending_mode_retried) = true;
+              id(send_mode_write).execute();
+              ESP_LOGW("pool", "Retrying mode write");
+            }
+          } else {
+            // No pending request — sync HA entity to current cache
+            const char* mode_str = (id(cache_mode)==0) ? "Cool" :
+                                   (id(cache_mode)==1) ? "Heat" : "Auto";
+            id(mode_select).publish_state(mode_str);
+          }
+
+          // ----- Cool setpoint confirmation -----
+          if (id(pending_cool_setpoint) >= 0) {
+            uint32_t age = now - id(pending_cool_setpoint_ts);
+            if (id(cache_cool_setpoint) == id(pending_cool_setpoint)) {
+              id(cool_setpoint_number).publish_state(id(cache_cool_setpoint));
+              id(pending_cool_setpoint) = -1;
+              id(pending_cool_setpoint_retried) = false;
+            } else if (age > 10000) {
+              char buf[120];
+              snprintf(buf, sizeof(buf),
+                "Cool setpoint rejected: requested %d°F, reads %d°F (unit off?)",
+                id(pending_cool_setpoint), id(cache_cool_setpoint));
+              err = buf;
+              id(pending_cool_setpoint) = -1;
+              id(pending_cool_setpoint_retried) = false;
+            } else if (age > 5000 && !id(pending_cool_setpoint_retried)) {
+              id(pending_cool_setpoint_retried) = true;
+              id(send_full_block).execute();
+              ESP_LOGW("pool", "Retrying cool setpoint write");
+            }
+          } else {
+            // No pending request — sync HA entity to current cache
+            id(cool_setpoint_number).publish_state(id(cache_cool_setpoint));
+          }
+
+          // ----- Heat setpoint confirmation -----
+          if (id(pending_heat_setpoint) >= 0) {
+            uint32_t age = now - id(pending_heat_setpoint_ts);
+            if (id(cache_heat_setpoint) == id(pending_heat_setpoint)) {
+              id(heat_setpoint_number).publish_state(id(cache_heat_setpoint));
+              id(pending_heat_setpoint) = -1;
+              id(pending_heat_setpoint_retried) = false;
+            } else if (age > 10000) {
+              char buf[120];
+              snprintf(buf, sizeof(buf),
+                "Heat setpoint rejected: requested %d°F, reads %d°F (unit off?)",
+                id(pending_heat_setpoint), id(cache_heat_setpoint));
+              err = buf;
+              id(pending_heat_setpoint) = -1;
+              id(pending_heat_setpoint_retried) = false;
+            } else if (age > 5000 && !id(pending_heat_setpoint_retried)) {
+              id(pending_heat_setpoint_retried) = true;
+              id(send_full_block).execute();
+              ESP_LOGW("pool", "Retrying heat setpoint write");
+            }
+          } else {
+            // No pending request — sync HA entity to current cache
+            id(heat_setpoint_number).publish_state(id(cache_heat_setpoint));
+          }
+
+          // ----- Auto setpoint confirmation -----
+          if (id(pending_auto_setpoint) >= 0) {
+            uint32_t age = now - id(pending_auto_setpoint_ts);
+            if (id(cache_auto_setpoint) == id(pending_auto_setpoint)) {
+              id(auto_setpoint_number).publish_state(id(cache_auto_setpoint));
+              id(pending_auto_setpoint) = -1;
+              id(pending_auto_setpoint_retried) = false;
+            } else if (age > 10000) {
+              char buf[120];
+              snprintf(buf, sizeof(buf),
+                "Auto setpoint rejected: requested %d°F, reads %d°F",
+                id(pending_auto_setpoint), id(cache_auto_setpoint));
+              err = buf;
+              id(pending_auto_setpoint) = -1;
+              id(pending_auto_setpoint_retried) = false;
+            } else if (age > 5000 && !id(pending_auto_setpoint_retried)) {
+              id(pending_auto_setpoint_retried) = true;
+              id(send_auto_setpoint_write).execute();
+              ESP_LOGW("pool", "Retrying auto setpoint write");
+            }
+          } else {
+            // No pending request — sync HA entity to current cache
+            id(auto_setpoint_number).publish_state(id(cache_auto_setpoint));
+          }
+
+          // ----- Energy mode confirmation -----
+          if (id(pending_energy) >= 0) {
+            uint32_t age = now - id(pending_energy_ts);
+            if (id(cache_energy) == id(pending_energy)) {
+              const char* e_str = (id(cache_energy)==0) ? "Standard" :
+                                  (id(cache_energy)==1) ? "Boost" : "Eco";
+              id(energy_select).publish_state(e_str);
+              id(pending_energy) = -1;
+              id(pending_energy_retried) = false;
+            } else if (age > 10000) {
+              char buf[100];
+              snprintf(buf, sizeof(buf),
+                "Energy mode rejected: requested %d, reads %d",
+                id(pending_energy), id(cache_energy));
+              err = buf;
+              id(pending_energy) = -1;
+              id(pending_energy_retried) = false;
+            } else if (age > 5000 && !id(pending_energy_retried)) {
+              id(pending_energy_retried) = true;
+              id(send_full_block).execute();
+              ESP_LOGW("pool", "Retrying energy mode write");
+            }
+          } else {
+            // No pending request — sync HA entity to current cache
+            const char* e_str = (id(cache_energy)==0) ? "Standard" :
+                                (id(cache_energy)==1) ? "Boost" : "Eco";
+            id(energy_select).publish_state(e_str);
+          }
+
+          // Publish error (or clear) if anything changed
+          if (!err.empty()) {
+            id(last_error).publish_state(err);
+            ESP_LOGE("pool", "%s", err.c_str());
+          }
+
+# ====================================================================
+# Modbus controller — register polling (read-only block)
+# Reading 9 regs at 0x0300 = cool, heat, upper, lower, mode, power, _, energy, version
+# Plus reg 0x030B for auto setpoint
+# ====================================================================
+sensor:
+  # ----- Control block: poll 0x0300, 9 registers -----
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_cool_setpoint
+    register_type: holding
+    address: 0x0300
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_cool_setpoint) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_heat_setpoint
+    register_type: holding
+    address: 0x0301
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_heat_setpoint) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_upper
+    register_type: holding
+    address: 0x0302
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_upper_bound) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_lower
+    register_type: holding
+    address: 0x0303
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_lower_bound) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_mode
+    register_type: holding
+    address: 0x0304
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_mode) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_power
+    register_type: holding
+    address: 0x0305
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_power) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_energy
+    register_type: holding
+    address: 0x0307
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_energy) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_version
+    register_type: holding
+    address: 0x0308
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_version) = (int)x;'
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: reg_auto_setpoint
+    register_type: holding
+    address: 0x030B
+    value_type: U_WORD
+    internal: true
+    on_value:
+      then:
+        - lambda: 'id(cache_auto_setpoint) = (int)x;'
+        - script.execute: check_confirmations  # final cache update triggers verification
+
+  # ----- Operational sensors (all temps native °F, no conversion) -----
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Compressor Frequency"
+    address: 64
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "Hz"
+    icon: mdi:sine-wave
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Fan Frequency"
+    address: 65
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "Hz"
+    icon: mdi:fan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater EEV Opening"
+    address: 66
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "steps"
+    icon: mdi:valve
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Energy Total"
+    address: 72
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Ambient Temp"
+    address: 74
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Coiler Temp"
+    address: 75
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Incoiler Temp"
+    address: 76
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Suction Temp"
+    address: 77
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Discharge Temp"
+    address: 78
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Outlet Water Temp"
+    address: 80
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Inlet Water Temp"
+    address: 84
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Fault Code"
+    id: reg_fault
+    address: 29
+    register_type: holding
+    value_type: U_WORD
+    icon: mdi:alert
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Active Heating"
+    id: active_heating
+    address: 70
+    register_type: holding
+    value_type: U_WORD
+    icon: mdi:waves-arrow-right
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Water Temp (display)"
+    address: 79
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-water
+
+  # ====================================================================
+  # Internal diagnostic registers — non-zero values, purpose TBD
+  # Visible at http://pool-heatpump.local/ but not shown in HA
+  #
+  #   Reg 68: stable ~233-241, possible pressure or status
+  #   Reg 69: varies with compressor load, refrigerant-related
+  #   Reg 71: varies with compressor load, refrigerant temp
+  #   Reg 81: -58 signed = E14 hot water tank sensor not installed (ignore)
+  #   Reg 83: always 1 when powered, purpose unknown
+  # ====================================================================
+
+
+
+
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 68"
+    address: 68
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 69"
+    address: 69
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 71"
+    address: 71
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 81"
+    address: 81
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 83"
+    address: 83
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+
+# ====================================================================
+# Control entities exposed to Home Assistant
+# ====================================================================
+switch:
+  - platform: template
+    name: "Pool Heater Power"
+    id: power_switch
+    icon: mdi:power
+    optimistic: false
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          id(cache_power) = 1;
+          id(pending_power_value) = 1;
+          id(pending_power_ts) = millis();
+          id(pending_power_retried) = false;
+      - script.execute: send_full_block
+    turn_off_action:
+      - lambda: |-
+          id(cache_power) = 0;
+          id(pending_power_value) = 0;
+          id(pending_power_ts) = millis();
+          id(pending_power_retried) = false;
+      - script.execute: send_full_block
+
+select:
+  - platform: template
+    name: "Pool Heater Mode"
+    id: mode_select
+    icon: mdi:thermostat
+    optimistic: false
+    options:
+      - "Cool"
+      - "Heat"
+      - "Auto"
+    set_action:
+      - lambda: |-
+          int v = 1;
+          if (x == "Cool") v = 0;
+          else if (x == "Heat") v = 1;
+          else if (x == "Auto") v = 8;
+          id(cache_mode) = v;
+          id(pending_mode_value) = v;
+          id(pending_mode_ts) = millis();
+          id(pending_mode_retried) = false;
+      - script.execute: send_mode_write
+
+  - platform: template
+    name: "Pool Heater Energy Mode"
+    id: energy_select
+    icon: mdi:leaf
+    optimistic: false
+    options:
+      - "Standard"
+      - "Boost"
+      - "Eco"
+    set_action:
+      - lambda: |-
+          int v = 0;
+          if (x == "Standard") v = 0;
+          else if (x == "Boost") v = 1;
+          else if (x == "Eco") v = 2;
+          id(cache_energy) = v;
+          id(pending_energy) = v;
+          id(pending_energy_ts) = millis();
+          id(pending_energy_retried) = false;
+      - script.execute: send_full_block
+
+number:
+  - platform: template
+    name: "Pool Heater Cool Setpoint"
+    id: cool_setpoint_number
+    icon: mdi:snowflake-thermometer
+    unit_of_measurement: "°F"
+    min_value: 47
+    max_value: 83
+    step: 1
+    mode: box
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = (int)x;
+          id(cache_cool_setpoint) = v;
+          id(pending_cool_setpoint) = v;
+          id(pending_cool_setpoint_ts) = millis();
+          id(pending_cool_setpoint_retried) = false;
+      - script.execute: send_full_block
+
+  - platform: template
+    name: "Pool Heater Heat Setpoint"
+    id: heat_setpoint_number
+    icon: mdi:fire-circle
+    unit_of_measurement: "°F"
+    min_value: 47
+    max_value: 104
+    step: 1
+    mode: box
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = (int)x;
+          id(cache_heat_setpoint) = v;
+          id(pending_heat_setpoint) = v;
+          id(pending_heat_setpoint_ts) = millis();
+          id(pending_heat_setpoint_retried) = false;
+      - script.execute: send_full_block
+
+  - platform: template
+    name: "Pool Heater Auto Setpoint"
+    id: auto_setpoint_number
+    icon: mdi:thermometer-auto
+    unit_of_measurement: "°F"
+    min_value: 47
+    max_value: 104
+    step: 1
+    mode: box
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int v = (int)x;
+          id(cache_auto_setpoint) = v;
+          id(pending_auto_setpoint) = v;
+          id(pending_auto_setpoint_ts) = millis();
+          id(pending_auto_setpoint_retried) = false;
+      - script.execute: send_auto_setpoint_write
