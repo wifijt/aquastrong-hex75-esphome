@@ -33,7 +33,7 @@ esp32:
 
 logger:
   level: INFO
-  baud_rate: 0  # disable UART logging; UART0 used elsewhere if needed
+  baud_rate: 0
 
 api:
   encryption:
@@ -52,6 +52,9 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+
+safe_mode:
+  disabled: true
 
 # ====================================================================
 # UART + Modbus
@@ -83,8 +86,6 @@ modbus_controller:
 # ====================================================================
 # Globals: cached register block + pending state tracking
 # ====================================================================
-# Cache of the 9-register block at 0x0300 (needed for FC=10 block writes
-# since we must preserve other fields when modifying one).
 globals:
   - id: cache_cool_setpoint
     type: int
@@ -123,7 +124,6 @@ globals:
     restore_value: no
     initial_value: '80'
 
-  # Pending request tracking (requested value + timestamp + retry flag)
   - id: pending_power_value
     type: int
     restore_value: no
@@ -212,12 +212,38 @@ text_sensor:
     icon: mdi:alert-circle-outline
     update_interval: never
 
+  - platform: template
+    name: "Pool Heater Fault"
+    icon: mdi:alert-circle
+    update_interval: 5s
+    lambda: |-
+      if (!id(reg_fault).has_state()) return {};
+      if (id(cache_power) == 0) return std::string("Off");
+      uint16_t f = (uint16_t)id(reg_fault).state;
+      if (f == 255) return std::string("OK");
+      if (f == 511) return std::string("E03 Water Flow");
+      // Hypothesis: bitfield, each fault adds 0x100 to baseline 0xFF
+      // e.g. 767=E05 high pressure?, 1023=E06 low pressure?
+      // Unconfirmed until triggered naturally — log for identification
+      char buf[30];
+      snprintf(buf, sizeof(buf), "Fault 0x%04X (%d)", f, f);
+      return std::string(buf);
+
 # ====================================================================
-# Binary sensors: fault bit decode (reg 29 is a bitfield)
-# Baseline = 255 (0xFF) means no faults.
-# Bit 8 (0x100) confirmed = E03 Water Flow Switch Fault (reg 29 = 511)
-# Full OEM fault code table in docs/PROTOCOL.md
-# Other bit mappings TBD — contributions welcome
+# Binary sensors
+#
+# Reg 29 (Flow Status):
+#   255 = water flow present (normal)
+#   511 = no water flow — unit refuses to run (protection, not a fault)
+#   Other values = potential E-code fault state (TBD)
+#
+# Reg 98 (Water Flow boolean) — confirmed by test:
+#   1 = flow present
+#   0 = no flow
+#
+# Regs 96, 97, 99 = other protection status bits (TBD)
+#   Hypothesis: 1=OK, 0=fault, same pattern as reg 98
+#   Candidates: high pressure (E05), low pressure (E06), phase (E01/E02)
 # ====================================================================
 binary_sensor:
   - platform: template
@@ -227,17 +253,19 @@ binary_sensor:
     icon: mdi:alert
     lambda: |-
       if (!id(reg_fault).has_state()) return {};
-      return id(reg_fault).state != 255;
+      uint16_t f = (uint16_t)id(reg_fault).state;
+      // 255=normal, 511=no-flow protection (not an error per se)
+      // Any other value = real E-code fault
+      return f != 255 && f != 511;
 
   - platform: template
-    name: "Pool Heater Water Flow Fault"
-    id: water_flow_fault
-    device_class: problem
-    icon: mdi:water-off
+    name: "Pool Heater Water Flow"
+    id: water_flow
+    device_class: running
+    icon: mdi:water
     lambda: |-
-      if (!id(reg_fault).has_state()) return {};
-      uint16_t f = (uint16_t)id(reg_fault).state;
-      return (f & 0x0100) != 0;
+      if (!id(reg_water_flow).has_state()) return {};
+      return id(reg_water_flow).state == 1;  // 1=flow present, 0=no flow
 
   - platform: template
     name: "Pool Heater Heating Active"
@@ -249,12 +277,9 @@ binary_sensor:
       return id(active_heating).state > 0;
 
 # ====================================================================
-# Scripts: build & send writes
+# Scripts
 # ====================================================================
 script:
-  # ----- Build & send the full 9-register block at 0x0300 -----
-  # Used for: power on/off, cool setpoint, heat setpoint, energy mode
-  # All these require writing the full block to preserve other fields.
   - id: send_full_block
     mode: queued
     then:
@@ -277,7 +302,6 @@ script:
             id(cache_cool_setpoint), id(cache_heat_setpoint),
             id(cache_mode), id(cache_power), id(cache_energy));
 
-  # ----- Single-register write to 0x0304 (mode) -----
   - id: send_mode_write
     mode: queued
     then:
@@ -287,7 +311,6 @@ script:
           id(heatpump)->queue_command(cmd);
           ESP_LOGI("pool", "Sent mode write: 0x%02X", id(cache_mode));
 
-  # ----- Single-register write to 0x030B (Auto setpoint) -----
   - id: send_auto_setpoint_write
     mode: queued
     then:
@@ -297,11 +320,6 @@ script:
           id(heatpump)->queue_command(cmd);
           ESP_LOGI("pool", "Sent auto setpoint: %d", id(cache_auto_setpoint));
 
-  # ----- Confirmation watcher: runs every 2s after each poll -----
-  # Compares pending requests vs cached (just-read) values.
-  # If match → publish confirmed value to HA entity, clear pending.
-  # If 5s elapsed and not retried → retry once.
-  # If 10s elapsed → write error to text_sensor, clear pending.
   - id: check_confirmations
     mode: single
     then:
@@ -309,7 +327,7 @@ script:
           uint32_t now = millis();
           std::string err = "";
 
-          // ----- Power confirmation -----
+          // ----- Power -----
           if (id(pending_power_value) >= 0) {
             uint32_t age = now - id(pending_power_ts);
             if (id(cache_power) == id(pending_power_value)) {
@@ -318,8 +336,7 @@ script:
               id(pending_power_retried) = false;
             } else if (age > 10000) {
               char buf[100];
-              snprintf(buf, sizeof(buf),
-                "Power write rejected: requested %d, reads %d",
+              snprintf(buf, sizeof(buf), "Power write rejected: requested %d, reads %d",
                 id(pending_power_value), id(cache_power));
               err = buf;
               id(pending_power_value) = -1;
@@ -330,11 +347,10 @@ script:
               ESP_LOGW("pool", "Retrying power write");
             }
           } else {
-            // No pending request — sync HA entity to current cache
             id(power_switch).publish_state(id(cache_power) == 1);
           }
 
-          // ----- Mode confirmation -----
+          // ----- Mode -----
           if (id(pending_mode_value) >= 0) {
             uint32_t age = now - id(pending_mode_ts);
             if (id(cache_mode) == id(pending_mode_value)) {
@@ -345,8 +361,7 @@ script:
               id(pending_mode_retried) = false;
             } else if (age > 10000) {
               char buf[100];
-              snprintf(buf, sizeof(buf),
-                "Mode write rejected: requested 0x%02X, reads 0x%02X",
+              snprintf(buf, sizeof(buf), "Mode write rejected: requested 0x%02X, reads 0x%02X",
                 id(pending_mode_value), id(cache_mode));
               err = buf;
               id(pending_mode_value) = -1;
@@ -357,13 +372,12 @@ script:
               ESP_LOGW("pool", "Retrying mode write");
             }
           } else {
-            // No pending request — sync HA entity to current cache
             const char* mode_str = (id(cache_mode)==0) ? "Cool" :
                                    (id(cache_mode)==1) ? "Heat" : "Auto";
             id(mode_select).publish_state(mode_str);
           }
 
-          // ----- Cool setpoint confirmation -----
+          // ----- Cool setpoint -----
           if (id(pending_cool_setpoint) >= 0) {
             uint32_t age = now - id(pending_cool_setpoint_ts);
             if (id(cache_cool_setpoint) == id(pending_cool_setpoint)) {
@@ -372,8 +386,7 @@ script:
               id(pending_cool_setpoint_retried) = false;
             } else if (age > 10000) {
               char buf[120];
-              snprintf(buf, sizeof(buf),
-                "Cool setpoint rejected: requested %d°F, reads %d°F (unit off?)",
+              snprintf(buf, sizeof(buf), "Cool setpoint rejected: requested %d°F, reads %d°F (unit off?)",
                 id(pending_cool_setpoint), id(cache_cool_setpoint));
               err = buf;
               id(pending_cool_setpoint) = -1;
@@ -384,11 +397,10 @@ script:
               ESP_LOGW("pool", "Retrying cool setpoint write");
             }
           } else {
-            // No pending request — sync HA entity to current cache
             id(cool_setpoint_number).publish_state(id(cache_cool_setpoint));
           }
 
-          // ----- Heat setpoint confirmation -----
+          // ----- Heat setpoint -----
           if (id(pending_heat_setpoint) >= 0) {
             uint32_t age = now - id(pending_heat_setpoint_ts);
             if (id(cache_heat_setpoint) == id(pending_heat_setpoint)) {
@@ -397,8 +409,7 @@ script:
               id(pending_heat_setpoint_retried) = false;
             } else if (age > 10000) {
               char buf[120];
-              snprintf(buf, sizeof(buf),
-                "Heat setpoint rejected: requested %d°F, reads %d°F (unit off?)",
+              snprintf(buf, sizeof(buf), "Heat setpoint rejected: requested %d°F, reads %d°F (unit off?)",
                 id(pending_heat_setpoint), id(cache_heat_setpoint));
               err = buf;
               id(pending_heat_setpoint) = -1;
@@ -409,11 +420,10 @@ script:
               ESP_LOGW("pool", "Retrying heat setpoint write");
             }
           } else {
-            // No pending request — sync HA entity to current cache
             id(heat_setpoint_number).publish_state(id(cache_heat_setpoint));
           }
 
-          // ----- Auto setpoint confirmation -----
+          // ----- Auto setpoint -----
           if (id(pending_auto_setpoint) >= 0) {
             uint32_t age = now - id(pending_auto_setpoint_ts);
             if (id(cache_auto_setpoint) == id(pending_auto_setpoint)) {
@@ -422,8 +432,7 @@ script:
               id(pending_auto_setpoint_retried) = false;
             } else if (age > 10000) {
               char buf[120];
-              snprintf(buf, sizeof(buf),
-                "Auto setpoint rejected: requested %d°F, reads %d°F",
+              snprintf(buf, sizeof(buf), "Auto setpoint rejected: requested %d°F, reads %d°F",
                 id(pending_auto_setpoint), id(cache_auto_setpoint));
               err = buf;
               id(pending_auto_setpoint) = -1;
@@ -434,11 +443,10 @@ script:
               ESP_LOGW("pool", "Retrying auto setpoint write");
             }
           } else {
-            // No pending request — sync HA entity to current cache
             id(auto_setpoint_number).publish_state(id(cache_auto_setpoint));
           }
 
-          // ----- Energy mode confirmation -----
+          // ----- Energy mode -----
           if (id(pending_energy) >= 0) {
             uint32_t age = now - id(pending_energy_ts);
             if (id(cache_energy) == id(pending_energy)) {
@@ -449,8 +457,7 @@ script:
               id(pending_energy_retried) = false;
             } else if (age > 10000) {
               char buf[100];
-              snprintf(buf, sizeof(buf),
-                "Energy mode rejected: requested %d, reads %d",
+              snprintf(buf, sizeof(buf), "Energy mode rejected: requested %d, reads %d",
                 id(pending_energy), id(cache_energy));
               err = buf;
               id(pending_energy) = -1;
@@ -461,25 +468,21 @@ script:
               ESP_LOGW("pool", "Retrying energy mode write");
             }
           } else {
-            // No pending request — sync HA entity to current cache
             const char* e_str = (id(cache_energy)==0) ? "Standard" :
                                 (id(cache_energy)==1) ? "Boost" : "Eco";
             id(energy_select).publish_state(e_str);
           }
 
-          // Publish error (or clear) if anything changed
           if (!err.empty()) {
             id(last_error).publish_state(err);
             ESP_LOGE("pool", "%s", err.c_str());
           }
 
 # ====================================================================
-# Modbus controller — register polling (read-only block)
-# Reading 9 regs at 0x0300 = cool, heat, upper, lower, mode, power, _, energy, version
-# Plus reg 0x030B for auto setpoint
+# Sensors
 # ====================================================================
 sensor:
-  # ----- Control block: poll 0x0300, 9 registers -----
+  # ----- Control block (0x0300-0x030B) — internal cache -----
   - platform: modbus_controller
     modbus_controller_id: heatpump
     id: reg_cool_setpoint
@@ -578,9 +581,9 @@ sensor:
     on_value:
       then:
         - lambda: 'id(cache_auto_setpoint) = (int)x;'
-        - script.execute: check_confirmations  # final cache update triggers verification
+        - script.execute: check_confirmations
 
-  # ----- Operational sensors (all temps native °F, no conversion) -----
+  # ----- Operational sensors -----
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Compressor Frequency"
@@ -677,12 +680,15 @@ sensor:
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Fault Code"
+    name: "Pool Heater Flow Status"
     id: reg_fault
     address: 29
     register_type: holding
     value_type: U_WORD
-    icon: mdi:alert
+    icon: mdi:water-check
+    # 255 = water flow present
+    # 511 = no flow (protection mode, not a fault per se)
+    # Other = potential E-code fault (TBD)
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -692,6 +698,8 @@ sensor:
     register_type: holding
     value_type: U_WORD
     icon: mdi:waves-arrow-right
+    # Scales with compressor load (~= compressor Hz)
+    # Non-zero = unit is actively transferring heat
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -701,66 +709,1656 @@ sensor:
     value_type: U_WORD
     unit_of_measurement: "°F"
     icon: mdi:thermometer-water
+    # Mirrors inlet water temp — smoothed value used by display
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Running State"
+    address: 785
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+    icon: mdi:state-machine
+    # 0x1C (28) = post-shutdown equalization
+    # 0x1D (29) = protection/startup/running low-mid load
+    # 0x1E (30) = ramping up
+    # 0x20 (32) = idle (compressor off, flow present)
+    # 0x21 (33) = running steady heat (higher load)
+    # 0x22 (34) = transitional
+    # 0x23 (35) = cool mode related
 
   # ====================================================================
-  # Internal diagnostic registers — non-zero values, purpose TBD
-  # Visible at http://pool-heatpump.local/ but not shown in HA
-  #
-  #   Reg 68: stable ~233-241, possible pressure or status
-  #   Reg 69: varies with compressor load, refrigerant-related
-  #   Reg 71: varies with compressor load, refrigerant temp
-  #   Reg 81: -58 signed = E14 hot water tank sensor not installed (ignore)
-  #   Reg 83: always 1 when powered, purpose unknown
+  # Diagnostic sensors — non-zero values, purpose being decoded
+  # All visible at http://pool-heatpump.local/
   # ====================================================================
 
-
-
-
-
+  # Reg 68: stable ~239-244, hypothesis = AC input voltage (V)
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Diag Reg 68"
     address: 68
     register_type: holding
     value_type: U_WORD
-    internal: true
 
+  # Reg 69: scales with compressor load (~1.5-1.7× Hz), hypothesis = input current ×0.1A
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Diag Reg 69"
     address: 69
     register_type: holding
     value_type: U_WORD
-    internal: true
 
+  # Reg 71: varies with compressor load, hypothesis = refrigerant temp
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Diag Reg 71"
     address: 71
     register_type: holding
     value_type: U_WORD
-    internal: true
 
-
-  - platform: modbus_controller
-    modbus_controller_id: heatpump
-    name: "Diag Reg 81"
-    address: 81
-    register_type: holding
-    value_type: U_WORD
-    internal: true
-
-
+  # Reg 83: always 1 when powered, purpose unknown
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Diag Reg 83"
     address: 83
     register_type: holding
     value_type: U_WORD
-    internal: true
+
+  # ====================================================================
+  # Protection status bits (96-99)
+  # Pattern: 1=OK, 0=fault/protection active
+  # Reg 98 confirmed = water flow (E03)
+  # Regs 96, 97, 99 = TBD (candidates: E05 high pressure, E06 low pressure, phase)
+  # ====================================================================
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 96"
+    address: 96
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 97"
+    address: 97
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Pool Heater Water Flow Sensor"
+    id: reg_water_flow
+    address: 98
+    register_type: holding
+    value_type: U_WORD
+    icon: mdi:waves
+    # 1 = water flow present
+    # 0 = no flow (E03 water flow protection)
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 99"
+    address: 99
+    register_type: holding
+    value_type: U_WORD
+
+  # ====================================================================
+  # 0x0100+ range — interesting non-zero values
+  # 265=1 (boolean flag TBD)
+  # 270=2, 271=10 (small counters TBD)
+  # 272=998 (possible running hours counter)
+  # 273=1 (boolean)
+  # 274=86, 275=90 (hypothesis: refrigerant pressures, PSI)
+  # 276=2 (small counter)
+  # 277-280 (various non-zero)
+  # 284-293 (config mirrors: setpoints, bounds, version flag)
+  # 294=ambient temp mirror
+  # 296-303 (various)
+  # ====================================================================
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 265"
+    address: 265
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 270"
+    address: 270
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 271"
+    address: 271
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 272"
+    address: 272
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 273"
+    address: 273
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 274"
+    address: 274
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 275"
+    address: 275
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 276"
+    address: 276
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 277"
+    address: 277
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 278"
+    address: 278
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 279"
+    address: 279
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 280"
+    address: 280
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 284"
+    address: 284
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 285"
+    address: 285
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 286"
+    address: 286
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 287"
+    address: 287
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 288"
+    address: 288
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 289"
+    address: 289
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 290"
+    address: 290
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 291"
+    address: 291
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 292"
+    address: 292
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 293"
+    address: 293
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 294"
+    address: 294
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 296"
+    address: 296
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 297"
+    address: 297
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 298"
+    address: 298
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 299"
+    address: 299
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 300"
+    address: 300
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 301"
+    address: 301
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 302"
+    address: 302
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 303"
+    address: 303
+    register_type: holding
+    value_type: U_WORD
+
+  # ====================================================================
+  # 0x0800 range (2048-2063) — structured data, possibly firmware/timestamp
+  # 2048-2049 = 1,1 (version/unit ID)
+  # 2050-2053 = 7,23,30,158 (possible timestamp: month/day/min/sec?)
+  # 2054-2057 = 9,9,9,9 (firmware sub-version?)
+  # 2060 = 104 (upper setpoint mirror)
+  # 2062 = 30 (mirrors running state value?)
+  # ====================================================================
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2048"
+    address: 2048
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2049"
+    address: 2049
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2050"
+    address: 2050
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2051"
+    address: 2051
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2052"
+    address: 2052
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2053"
+    address: 2053
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2054"
+    address: 2054
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2055"
+    address: 2055
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2056"
+    address: 2056
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2057"
+    address: 2057
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2058"
+    address: 2058
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2059"
+    address: 2059
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2060"
+    address: 2060
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2061"
+    address: 2061
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2062"
+    address: 2062
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 2063"
+    address: 2063
+    register_type: holding
+    value_type: U_WORD
+
+  # ====================================================================
+  # 0x0178-0x01C0 range (376-448) — historical session log
+  # Updates at end of run cycles, not real-time
+  # 376-384: ascending water temp sequence from last heat-up
+  # 391-398: sensor snapshot from last session
+  # 400-403: compressor frequency ramp-down log
+  # 406-410: operational parameters
+  # 425-448: small values (COP/efficiency metrics?)
+  # ====================================================================
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 376"
+    address: 376
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 377"
+    address: 377
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 378"
+    address: 378
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 379"
+    address: 379
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 380"
+    address: 380
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 381"
+    address: 381
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 382"
+    address: 382
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 383"
+    address: 383
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 384"
+    address: 384
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 385"
+    address: 385
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 386"
+    address: 386
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 387"
+    address: 387
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 388"
+    address: 388
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 389"
+    address: 389
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 390"
+    address: 390
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 391"
+    address: 391
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 392"
+    address: 392
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 393"
+    address: 393
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 394"
+    address: 394
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 395"
+    address: 395
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 396"
+    address: 396
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 397"
+    address: 397
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 398"
+    address: 398
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 399"
+    address: 399
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 400"
+    address: 400
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 401"
+    address: 401
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 402"
+    address: 402
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 403"
+    address: 403
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 406"
+    address: 406
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 407"
+    address: 407
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 408"
+    address: 408
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 409"
+    address: 409
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 410"
+    address: 410
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 417"
+    address: 417
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 418"
+    address: 418
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 425"
+    address: 425
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 426"
+    address: 426
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 427"
+    address: 427
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 428"
+    address: 428
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 429"
+    address: 429
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 430"
+    address: 430
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 431"
+    address: 431
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 432"
+    address: 432
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 433"
+    address: 433
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 434"
+    address: 434
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 435"
+    address: 435
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 436"
+    address: 436
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 437"
+    address: 437
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 438"
+    address: 438
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 439"
+    address: 439
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 440"
+    address: 440
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 441"
+    address: 441
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 442"
+    address: 442
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 443"
+    address: 443
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 444"
+    address: 444
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 445"
+    address: 445
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 446"
+    address: 446
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 447"
+    address: 447
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 448"
+    address: 448
+    register_type: holding
+    value_type: U_WORD
+
+  # ====================================================================
+  # 0x01C1-0x022D range (449-557) — session/efficiency logs
+  # 449-538: small values 1-9, possible COP or efficiency metrics per session
+  # 539-544: operational parameters
+  # 545-552: repeating pairs (2, 54) — possible delta T / flow rate
+  # 553-556: mirrors fan frequency
+  # 557: mirrors compressor frequency
+  # ====================================================================
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 449"
+    address: 449
+    register_type: holding
+    value_type: U_WORD
+    force_new_range: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 450"
+    address: 450
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 451"
+    address: 451
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 452"
+    address: 452
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 453"
+    address: 453
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 454"
+    address: 454
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 455"
+    address: 455
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 456"
+    address: 456
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 457"
+    address: 457
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 458"
+    address: 458
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 459"
+    address: 459
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 460"
+    address: 460
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 461"
+    address: 461
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 462"
+    address: 462
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 463"
+    address: 463
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 464"
+    address: 464
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 465"
+    address: 465
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 466"
+    address: 466
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 467"
+    address: 467
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 468"
+    address: 468
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 469"
+    address: 469
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 470"
+    address: 470
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 471"
+    address: 471
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 472"
+    address: 472
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 473"
+    address: 473
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 474"
+    address: 474
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 475"
+    address: 475
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 476"
+    address: 476
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 477"
+    address: 477
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 478"
+    address: 478
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 479"
+    address: 479
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 480"
+    address: 480
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 481"
+    address: 481
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 482"
+    address: 482
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 483"
+    address: 483
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 484"
+    address: 484
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 485"
+    address: 485
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 486"
+    address: 486
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 487"
+    address: 487
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 488"
+    address: 488
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 489"
+    address: 489
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 490"
+    address: 490
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 491"
+    address: 491
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 492"
+    address: 492
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 493"
+    address: 493
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 494"
+    address: 494
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 495"
+    address: 495
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 496"
+    address: 496
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 497"
+    address: 497
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 498"
+    address: 498
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 499"
+    address: 499
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 500"
+    address: 500
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 501"
+    address: 501
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 502"
+    address: 502
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 503"
+    address: 503
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 504"
+    address: 504
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 505"
+    address: 505
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 506"
+    address: 506
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 507"
+    address: 507
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 508"
+    address: 508
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 509"
+    address: 509
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 510"
+    address: 510
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 511"
+    address: 511
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 512"
+    address: 512
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 513"
+    address: 513
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 514"
+    address: 514
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 515"
+    address: 515
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 516"
+    address: 516
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 517"
+    address: 517
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 518"
+    address: 518
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 519"
+    address: 519
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 520"
+    address: 520
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 521"
+    address: 521
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 522"
+    address: 522
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 523"
+    address: 523
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 524"
+    address: 524
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 525"
+    address: 525
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 526"
+    address: 526
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 527"
+    address: 527
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 528"
+    address: 528
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 529"
+    address: 529
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 530"
+    address: 530
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 531"
+    address: 531
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 532"
+    address: 532
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 533"
+    address: 533
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 534"
+    address: 534
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 535"
+    address: 535
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 536"
+    address: 536
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 537"
+    address: 537
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 538"
+    address: 538
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 539"
+    address: 539
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 540"
+    address: 540
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 541"
+    address: 541
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 542"
+    address: 542
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 543"
+    address: 543
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 544"
+    address: 544
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 545"
+    address: 545
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 546"
+    address: 546
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 547"
+    address: 547
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 548"
+    address: 548
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 549"
+    address: 549
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 550"
+    address: 550
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 551"
+    address: 551
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 552"
+    address: 552
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 553"
+    address: 553
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 554"
+    address: 554
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 555"
+    address: 555
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 556"
+    address: 556
+    register_type: holding
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Diag Reg 557"
+    address: 557
+    register_type: holding
+    value_type: U_WORD
 
 # ====================================================================
-# Control entities exposed to Home Assistant
+# Control entities
 # ====================================================================
 switch:
   - platform: template

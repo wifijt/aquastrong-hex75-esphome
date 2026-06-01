@@ -40,44 +40,99 @@ The unit's temperature display mode can typically be changed in the settings men
 | 775 | 0x0307 | Energy mode | 0=Standard, 1=Boost, 2=Eco |
 | 776 | 0x0308 | Version flag | 0x3B (always) |
 | 779 | 0x030B | Auto setpoint | 47-104°F |
-| 785 | 0x0311 | Running state echo | 0x20 idle, 0x21+ running |
+| 785 | 0x0311 | Running state echo | see below |
 
-### Sensors (60-95)
+### Sensors (registers 29-98)
 
-| Register | Purpose | Unit |
+| Register | Purpose | Unit | Notes |
+|---|---|---|---|
+| 29 | Flow status | — | 255=flow present, 511=no flow. See fault section. |
+| 64 | Compressor frequency | Hz | |
+| 65 | Fan frequency | Hz | |
+| 66 | EEV opening | steps | |
+| 68 | AC input voltage | V | Stable ~239-244V; hypothesis confirmed by voltage sag when compressor stops |
+| 69 | Compressor load metric | — | Scales ~1.5-1.7× compressor Hz; hypothesis = input current ×0.1A |
+| 70 | Active heating indicator | — | Non-zero when compressor running and heat transferring; mirrors compressor load |
+| 71 | Refrigerant temp | — | Varies with compressor load; point in refrigerant circuit TBD |
+| 72 | Energy total | ×0.01 kWh | |
+| 74 | Ambient temp | °F | |
+| 75 | Coiler temp (outdoor evaporator) | °F | |
+| 76 | Incoiler temp (indoor heat exchanger) | °F | |
+| 77 | Suction temp (refrigerant) | °F | |
+| 78 | Discharge temp (refrigerant) | °F | |
+| 79 | Water temp display (smoothed) | °F | Mirrors inlet; used by display for readout |
+| 80 | **Outlet water temp** | °F | Confirmed against OEM display |
+| 81 | Water tank sensor | signed | -58 = sensor not installed (E14, cosmetic) |
+| 83 | State flag | — | Always 1 when powered; purpose unknown |
+| 84 | **Inlet water temp** | °F | Confirmed against OEM display |
+
+### Protection status registers (96-99)
+
+These four registers form a protection status block. Pattern: **1 = OK, 0 = fault/protection active**.
+
+| Register | Normal | Fault | Confirmed |
+|---|---|---|---|
+| 96 | 1 | TBD | TBD — candidate: high pressure (E05)? |
+| 97 | 1 | TBD | TBD — candidate: low pressure (E06)? |
+| **98** | **1** | **0** | **Water flow protection (E03) — confirmed by test** |
+| 99 | 1 | TBD | TBD — candidate: phase fault (E01/E02)? |
+
+Reg 98 flips to 0 whenever the flow switch is open — both when the unit is off (normal, no error) and when the unit is running without flow (E03 fault condition). The display and Tuya app apply context: reg 98 = 0 is only surfaced as E03 when the unit is powered on.
+
+### Historical session log (registers 376-448)
+
+This range updates at the **end of run cycles**, not in real-time. It appears to log the most recently completed heating session.
+
+| Registers | Observed pattern | Hypothesis |
 |---|---|---|
-| 29 | Fault code bitfield | see below |
-| 64 | Compressor frequency | Hz |
-| 65 | Fan frequency | Hz |
-| 66 | EEV opening | steps |
-| 70 | Active heating indicator | non-zero when actively heating |
-| 72 | Energy total | ×0.01 kWh |
-| 74 | Ambient temp | °F |
-| 75 | Coiler temp (outdoor evaporator) | °F |
-| 76 | Incoiler temp (indoor heat exchanger) | °F |
-| 77 | Suction temp (refrigerant) | °F |
-| 78 | Discharge temp (refrigerant) | °F |
-| 79 | Water temp display (smoothed) | °F |
-| 80 | **Outlet water temp** | °F |
-| 81 | Water tank sensor | signed; -58 = sensor not installed |
-| 84 | **Inlet water temp** | °F |
+| 376-384 | Ascending temps (55→82°F) | Water temp at intervals during last heat-up |
+| 385 | 1 | Boolean flag |
+| 386 | ~200-240 | Possible session voltage or pressure reading |
+| 387 | ~239 | Mirrors ambient voltage |
+| 388 | ~133 | Possible session discharge temp snapshot |
+| 391-398 | Mixed temps matching known sensors | Sensor snapshot at session end |
+| 399 | 20 | Unknown |
+| 400-403 | 70, 60, 50, 40 | Compressor frequency ramp-down log |
+| 406-410 | ~42, 5, 41, 25, 27 | Operational parameters |
+| 417-418 | 25, 27 | Unknown pair |
+| 425-448 | Small values 5-45 | Possible COP or efficiency metrics per session |
 
-### Unknown/TBD registers
+### Efficiency/mirror log (registers 449-557)
 
-These return non-zero values but their function isn't fully decoded:
+Also updates at end of run cycles. Contains small values (1-9) and mirrors of operational data.
 
-| Register | Observed values | Hypothesis |
+| Registers | Observed pattern | Hypothesis |
 |---|---|---|
-| 68 | 233-241 (stable) | Possibly a pressure reading or status code |
-| 69 | 8-189 (varies with load) | Refrigerant high-side metric |
-| 71 | 71-95 (varies with load) | Refrigerant temp at another point |
-| 83 | always 1 when powered | State flag (purpose unknown) |
+| 449-538 | Small values 1-9 | COP or efficiency metrics, one per historical session |
+| 539-544 | 30, 30, 3, 9, 1, 30 | Operational parameters |
+| 545-552 | Repeating pairs: 2, 54 | Possible delta T / flow rate pairs |
+| 553-556 | Matches fan frequency | Fan frequency mirror (historical) |
+| 557 | Matches compressor frequency | Compressor frequency mirror (historical) |
 
-PRs to identify these welcome.
+### Structured data (registers 2048-2063)
 
-### Empty range
+| Registers | Observed values | Hypothesis |
+|---|---|---|
+| 2048-2049 | 1, 1 | Firmware version or unit type ID |
+| 2050-2053 | 7, 23, 30, 158 | Possible timestamp (month/day/min/sec?) |
+| 2054-2057 | 9, 9, 9, 9 | Firmware sub-version |
+| 2058-2059 | 0, 0 | Empty |
+| 2060 | 104 | Mirrors upper setpoint bound |
+| 2061 | 9 | Unknown |
+| 2062 | 30 | Mirrors running state value |
+| 2063 | 5 | Unknown |
 
-Registers 100-149 are present but consistently return 0 on this firmware. Other firmware versions may use this range.
+### Empty ranges
+
+The following register ranges consistently return 0 on this firmware:
+
+- Registers 60-63, 67, 73, 82, 85-95
+- Registers 100-164
+- Registers 256-264, 266-269, 281-283, 295
+- Registers 404-405, 411-416, 419-424
+- Registers 2058-2059
+
+Other firmware versions may use some of these ranges.
 
 ## Write operations
 
@@ -119,16 +174,65 @@ To preserve other fields when changing one, **read the block first**, modify onl
 
 When power is off (0x0305 = 0), the controller silently ignores setpoint changes. Writes get ACK'd but values don't update. The included ESPHome config detects this via readback comparison and surfaces the failure in a "Last Error" text sensor.
 
-## Fault code register (29) — bitfield
+## Flow status register (29)
 
-The fault code register is a bitfield, not a single fault code. Baseline value with no faults active is `255` (0xFF) — all eight low bits set is the "normal" pattern.
+Register 29 reports water flow switch state, encoded with a baseline:
 
-| Fault | Bit | Mask | Composite value (with 0xFF baseline) |
-|---|---|---|---|
-| Water Flow Protection | 8 | 0x0100 | 511 (0x01FF) |
-| Others | TBD | TBD | TBD |
+| Value | Meaning | Context |
+|---|---|---|
+| 255 (0xFF) | Flow switch closed — water flowing | Normal |
+| 511 (0x1FF) | Flow switch open — no water flow | Normal when unit is off; **E03 fault when unit is on** |
+| Other | Potential E-code fault (TBD) | Being decoded; see contributions |
 
-Only the Water Flow bit has been definitively decoded by observation. The full set of fault conditions the controller can report is documented in the OEM manual (see table below) — cross-referencing these against observed register values will complete the map over time.
+**Important:** 511 is not inherently a fault. The flow switch is open whenever no water is moving — including normal standby with pump off. The display and Tuya app only surface it as E03 when the unit is powered on and trying to run.
+
+Register 98 provides a simpler boolean view of the same sensor: **1 = flow present, 0 = no flow**.
+
+### Fault decode status
+
+| Reg 29 value | E-code | Status |
+|---|---|---|
+| 255 (0xFF) | None | Normal |
+| 511 (0x01FF) | **E03 Water Flow** | Confirmed by test |
+| Other values | TBD | Log and contribute — see CONTRIBUTING.md |
+
+Hypothesis: each additional E-code adds 0x100 to the baseline 0xFF (e.g. E05 high pressure may = 767, E06 low pressure = 1023). Unconfirmed until observed naturally.
+
+## State echo register (0x0311)
+
+The 0x0311 register (decimal 785) reflects current operational state:
+
+| Value | Hex | Conditions observed |
+|---|---|---|
+| 28 | 0x1C | Post-shutdown equalization (compressor off, EEV equalizing) |
+| 29 | 0x1D | Protection mode, startup dwell, or running at low-mid load |
+| 30 | 0x1E | Ramping up (compressor spinning up) |
+| 32 | 0x20 | Idle (powered on, compressor off, flow present) |
+| 33 | 0x21 | Running steady — heat mode (higher load) |
+| 34 | 0x22 | Transitional |
+| 35 | 0x23 | Cool mode related |
+
+**Note:** 0x1D is used across multiple states — protection mode, startup dwell, and normal running at low load. It is **not reliable as a fault indicator** on its own. Combine with reg 29 and compressor frequency for full state assessment.
+
+## Defrost mode — not yet identified
+
+The Tuya app displays a "Defrosting" status when the unit runs a defrost cycle (reversing refrigerant flow briefly to clear ice from the outdoor evaporator coil — happens periodically during heat operation in cool ambient conditions). The OEM display likely shows it as well.
+
+**We have not yet identified the register that reports defrost state.** Possibilities:
+
+- An additional bit in 0x0311 (state echo)
+- A separate flag register we haven't surveyed
+- Encoded into one of the unknown registers (68, 69, 71, 83)
+- Inferred by the Tuya WiFi module from refrigerant temperature patterns rather than a dedicated register
+
+To find it, watch the diagnostic register dumps during a defrost event. Defrost is typically characterized by:
+
+- Fan stopping (fan freq → 0) while compressor continues
+- Coiler temp rising (outdoor coil being heated)
+- Brief reversal of inlet/outlet water delta T
+- The Tuya app showing "Defrosting"
+
+If you capture a defrost event with this integration and identify which register changes, please contribute the finding back — see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## OEM fault code reference
 
@@ -140,7 +244,7 @@ The following fault codes come directly from the Aquastrong HEX 75 OEM manual. T
 |---|---|---|
 | E01 | Wrong phase fault | Power supply connected wrong phase |
 | E02 | Out of phase fault | Power supply missing phase |
-| **E03** | **Water flow switch fault** | **Confirmed: triggers reg 29 bit 0x100 (value 511)** |
+| **E03** | **Water flow switch fault** | **Confirmed: reg 29 = 511, reg 98 = 0** |
 | E04 | Main board and 4G module communication fault | |
 | E05 | High pressure switch protection | High-voltage switch, refrigerant, fan, or scale in heat exchanger |
 | E06 | Low pressure switch protection | Low-voltage switch, refrigerant, or fan fault |
@@ -216,56 +320,13 @@ The following fault codes come directly from the Aquastrong HEX 75 OEM manual. T
 | P42 | Compressor type code fault | Driver board problem |
 | P43 | Current sampling signal overcurrent | Same as P1 |
 
-### Fault register decode status
-
-| Observed reg 29 value | Confirmed E-code | Notes |
-|---|---|---|
-| 255 (0xFF) | None | Normal operating state, no faults |
-| 511 (0x01FF) | **E03** | Water flow switch fault — confirmed by test |
-| Others | TBD | Contributions welcome — see CONTRIBUTING.md |
-
 > **Note on reg 81 = -58:** Register 81 returns a large negative number on this unit. This corresponds to **E14 (Hot water tank temperature sensor failure)** — the sensor is simply not installed on this model. The Tuya app reports it as "Water Tank Temp Sensor Fault." It is a cosmetic/persistent fault that does not affect operation and can be ignored.
 
 ### Fault behavior
 
 - Faults are **non-latching**: they clear automatically when the condition resolves
 - After a fault clears, the compressor enforces a 3-5 minute restart delay (independent of the fault state)
-- The fault code register updates every poll cycle
-
-
-
-## State echo register (0x0311)
-
-The 0x0311 register reflects current operational state:
-
-| Value | Meaning |
-|---|---|
-| 0x20 | Idle (power on, no compressor) |
-| 0x21 | Running (heat) |
-| 0x22 | Transitional / cool-related |
-| 0x23 | Cool-related (compressor running) |
-
-Not strictly necessary for control — useful for monitoring.
-
-## Defrost mode — not yet identified
-
-The Tuya app displays a "Defrosting" status when the unit runs a defrost cycle (reversing refrigerant flow briefly to clear ice from the outdoor evaporator coil — happens periodically during heat operation in cool ambient conditions). The OEM display likely shows it as well.
-
-**We have not yet identified the register that reports defrost state.** Possibilities:
-
-- An additional bit in 0x0311 (state echo)
-- A separate flag register we haven't surveyed
-- Encoded into one of the unknown registers (68, 69, 71, 83)
-- Inferred by the Tuya WiFi module from refrigerant temperature patterns rather than a dedicated register
-
-To find it, watch the diagnostic register dumps during a defrost event. Defrost is typically characterized by:
-
-- Fan stopping (fan freq → 0) while compressor continues
-- Coiler temp rising (outdoor coil being heated)
-- Brief reversal of inlet/outlet water delta T
-- The Tuya app showing "Defrosting"
-
-If you capture a defrost event with this integration and identify which register changes, please contribute the finding back — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+- The fault code register (reg 29) and flow boolean (reg 98) update every poll cycle
 
 ## Setpoint ranges
 
@@ -301,5 +362,4 @@ Each register's purpose was validated by:
 2. Correlating writes to user actions (pressing buttons, changing setpoints)
 3. Reading the controller's response and matching against expected behavior
 4. Cross-checking sensor values against the display's labeled readout (the display's "Query" / parameter view screen)
-
-The mapping is high confidence for everything documented above; the unknown registers (68, 69, 71, 83) are simply waiting for more observation.
+5. Deliberate fault induction (flow switch test) to confirm protection register behavior
