@@ -1,5 +1,63 @@
 # Changelog
 
+## v1.2.0 — Bus resilience under EMI / ESPHome 2026.3.0+ compatibility
+
+### Critical fix: TX starvation on ESPHome 2026.3.0+
+
+**If you upgraded ESPHome past 2026.3.0 and the device stops responding to
+commands while the compressor runs, this release is the fix.**
+
+ESPHome 2026.3.0 rewrote the `modbus` component's transmit arbitration.
+The old component transmitted unconditionally; the new one refuses to
+transmit until the line has been idle for `frame_delay + turnaround_time`
+after **any** received byte. With the default `turnaround_time: 100ms`,
+noise arriving at just ~10 bytes/second blocks transmission permanently.
+Compressor VFD noise exceeds this easily — the result is an ESP that can
+read nothing and, worse, cannot deliver a power-off command while the
+compressor is generating the very noise that blocks it.
+
+Fix: `turnaround_time: 5ms` on the `modbus:` component. This shrinks the
+post-receive blackout to ~9ms, restoring most of the pre-2026.3
+talk-over-noise tolerance. `command_throttle` already paces the
+single-slave bus, so nothing of value is lost.
+
+### Bus-failure resilience (defense in depth)
+
+- `offline_skip_updates: 10` — when a command exhausts retries, all read
+  polling is suppressed for 10 cycles, draining the queue so pending
+  writes get a clear path
+- Pending writes are now **held during outages** (the 10s rejection error
+  only fires while the bus is online) and **resent automatically the
+  moment the bus recovers** (`on_online` hook)
+- Confirmation watchdog moved to a 5s timer so write retry/error
+  reporting works even when no reads succeed
+- Confirmation semantics hardened: a write is only confirmed when a
+  control-block read occurred **after** the write request
+  (`last_ctrl_read_ts >= pending_ts`), eliminating false self-confirmation
+  against the optimistic cache
+- Control entities are never published from boot-default cache values
+- Watchdog: automatic reboot only after 5 continuous minutes offline
+
+### Register map / performance
+
+- **Frame consolidation:** padded gaps in the 64-84 and 768-779 blocks so
+  each reads as a single Modbus frame. 5 frames per cycle vs ~10 before —
+  frame count (throttle slots) dominates bus time, not data bytes
+- New sensors: AC Voltage (reg 68), Compressor Load (reg 69), Refrigerant
+  Metric (reg 71), Protection Bits 96/97/99 (fault hunters: 1=OK, 0=fault)
+- New slow diagnostics (60s): Runtime Counter (reg 272), Pressure A/B
+  (regs 274/275 — refrigerant pressure candidates for future E05/E06
+  fault identification)
+- Update interval 2s → 5s
+- Note: reg 68 reads ~238V idle / ~243V running — measured post-PFC
+  stage, not raw line voltage (rises when PFC boost is active)
+
+### Housekeeping
+
+- All commented-out diagnostic scan blocks removed (2,487 → ~1,100 lines);
+  full scan blocks remain in git history for future decode sessions
+
+
 ## v1.1.0 — Register map expansion and flow status clarification
 
 ### New findings

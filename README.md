@@ -4,6 +4,16 @@ Local control of Aquastrong HEX 75 (and likely other CHICO-controlled) pool heat
 
 This project replaces the Tuya cloud integration with a fully local, fully controllable Home Assistant integration. The OEM display and Tuya WiFi remain functional alongside ESPHome.
 
+> [!WARNING]
+> **ESPHome 2026.3.0 or newer requires `turnaround_time: 5ms` on the
+> `modbus:` component** (included in `config/pool-heatpump.yaml` as of
+> v1.2.0). ESPHome 2026.3.0 changed Modbus transmit arbitration to wait
+> for a quiet line before sending; with the 100ms default, compressor
+> VFD noise blocks the ESP from transmitting at all — sensors stop
+> updating and, critically, **power commands cannot be delivered while
+> the compressor is running**. See docs/PROTOCOL.md and the v1.2.0
+> changelog for the full analysis.
+
 ## What you get
 
 - **Full local control**: power, mode (Cool/Heat/Auto), all three setpoints, energy mode (Standard/Boost/Eco)
