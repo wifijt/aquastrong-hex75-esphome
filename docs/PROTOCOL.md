@@ -50,8 +50,8 @@ The unit's temperature display mode can typically be changed in the settings men
 | 64 | Compressor frequency | Hz | |
 | 65 | Fan frequency | Hz | |
 | 66 | EEV opening | steps | |
-| 68 | AC input voltage | V | Stable ~239-244V; hypothesis confirmed by voltage sag when compressor stops |
-| 69 | Compressor load metric | — | Scales ~1.5-1.7× compressor Hz; hypothesis = input current ×0.1A |
+| 68 | AC voltage (post-PFC stage) | V | ~238V idle, ~243V compressor running. RISES under load — measured after the power-factor-correction boost stage, not raw line voltage. Useful brownout/P8-P10/P26 early warning. |
+| 69 | Compressor load metric | — | Scales ~1.5-1.7× compressor Hz (78 at 42Hz, 120 at 70Hz observed); hypothesis = input current ×0.1A |
 | 70 | Active heating indicator | — | Non-zero when compressor running and heat transferring; mirrors compressor load |
 | 71 | Refrigerant temp | — | Varies with compressor load; point in refrigerant circuit TBD |
 | 72 | Energy total | ×0.01 kWh | |
@@ -353,6 +353,51 @@ The controller does **not** handle two Modbus masters on the same bus. Attemptin
 - Spurious fault codes from the controller misinterpreting collided frames
 
 COM2 is a separate physical bus to the same controller. Using it for the ESP allows the display to remain fully functional on COM4.
+
+## ESPHome 2026.3.0+ transmit arbitration (critical)
+
+ESPHome 2026.3.0 rewrote the `modbus` component's transmit gating.
+Before 2026.3.0, the component transmitted unconditionally. From
+2026.3.0 on, it refuses to transmit until the RS-485 line has been
+idle for `frame_delay + turnaround_time` after **any** received byte
+(`Modbus::tx_blocked()`, conditions 1-5).
+
+With the default `turnaround_time: 100ms`, stray bytes arriving at
+just ~10/second block transmission **permanently**. Compressor VFD
+noise on this hardware exceeds that easily, producing a deadlock: the
+ESP cannot deliver a power-off command while the compressor generates
+the noise that blocks it. Observed in the field as 90+ seconds with
+zero transmitted frames ("...ms after last send" counting up in logs)
+while commands sat queued.
+
+**Required setting** (in `config/pool-heatpump.yaml` since v1.2.0):
+
+```yaml
+modbus:
+  turnaround_time: 5ms
+```
+
+This shrinks the post-receive blackout to ~9ms (frame delay ~4ms at
+9600 baud + 5ms). Noise then needs sustained sub-9ms gaps to starve
+transmission, restoring approximately the pre-2026.3 talk-over-noise
+behavior. The `command_throttle` on the controller already paces this
+single-slave bus, so the turnaround delay serves no purpose here.
+
+Symptoms if you hit this: all sensors stop updating while the
+compressor runs, writes are silently lost, logs show repeated
+"Clearing buffer" / "CRC check failed" warnings with the
+"after last send" timer growing unboundedly, and the device never
+reports offline (retries only count on transmitted frames — starved
+commands are never sent, so the retry counter never moves).
+
+### Frame count guidance
+
+Bus time is dominated by per-frame throttle slots, not data bytes. A
+21-register read costs one `command_throttle` slot — the same as a
+1-register read. When adding sensors, pad gaps with `internal: true`
+sensors so contiguous blocks read as single frames. The v1.2.0 config
+reads regs 29, 64-84, 96-99, 768-779, and 785 in five frames per
+cycle (plus 272-275 every 12th cycle).
 
 ## Validation methodology
 
