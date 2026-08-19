@@ -56,10 +56,17 @@ void Modbus::loop() {
     this->clear_rx_buffer_(LOG_STR("timeout after partial response"), true);
   }
 
-  // If we're past the send_wait_time timeout and response buffer doesn't have the start of the expected response
+  // LOCAL OVERRIDE (A): make the response timeout an unconditional timeout.
+  // Upstream also required (rx_buffer_.empty() || rx_buffer_[0] != waiting_for_response_),
+  // i.e. it refuses to give up while a partial frame whose first byte matches our
+  // slave address sits in the buffer. Under RS-485 noise, corrupted fragments
+  // frequently begin with the slave address, so waiting_for_response_ is never
+  // cleared -- and tx_blocked() condition 3 then starves Tx indefinitely.
+  // send_wait_time (250ms) is ~5x the longest legitimate reply on this bus
+  // (21 registers = ~47 bytes = ~49ms at 9600 baud), so once it elapses,
+  // giving up unconditionally is correct.
   if (this->waiting_for_response_ != 0 &&
-      millis() - this->last_send_ > this->last_send_tx_offset_ + this->send_wait_time_ &&
-      (this->rx_buffer_.empty() || this->rx_buffer_[0] != this->waiting_for_response_)) {
+      millis() - this->last_send_ > this->last_send_tx_offset_ + this->send_wait_time_) {
     ESP_LOGW(TAG, "Stop waiting for response from %" PRIu8 " %" PRIu32 "ms after last send",
              this->waiting_for_response_, millis() - this->last_send_);
     this->waiting_for_response_ = 0;
@@ -79,14 +86,13 @@ bool Modbus::tx_blocked() {
   // 4. The last sent byte isn't more than frame_delay ms ago (i.e. wait to tell receivers that our previous Tx is done)
   // 5. The last received byte isn't more than frame_delay ms ago (i.e. wait to be sure there isn't more Rx coming)
   // 6. If we're a client - also wait for the turnaround delay, to give the servers time to process the previous message
-  // LOCAL OVERRIDE - reverted toward pre-2026.3.0 "talk over noise" behavior.
-  // Dropped conditions 1, 2, 5, 6 (any Rx byte present / recent Rx byte /
-  // turnaround delay). On a single-slave RS-485 bus with compressor VFD noise
-  // these keep the Rx buffer permanently non-empty and starve Tx indefinitely,
-  // making it impossible to deliver a power-off command while the compressor
-  // is running. Conditions 1 and 2 are NOT tunable via turnaround_time.
-  // Kept conditions 3 and 4: both are self-referential (our own pending
-  // response, our own frame tail) and never noise-dependent.
+  // LOCAL OVERRIDE (B): drop the noise-sensitive blocking conditions 1, 2, 5, 6
+  // (any Rx byte available / any byte in our Rx buffer / recent Rx byte /
+  // turnaround delay). On a noisy single-slave RS-485 bus these are true
+  // essentially always, starving Tx. Conditions 1 and 2 are NOT reachable
+  // via the turnaround_time YAML option.
+  // Kept: condition 3 (awaiting our own response - now bounded by the
+  // unconditional timeout in Patch A) and condition 4 (our own frame tail).
   return (this->waiting_for_response_ != 0) ||
          (now - this->last_send_ < this->last_send_tx_offset_ + this->frame_delay_ms_);
 }
