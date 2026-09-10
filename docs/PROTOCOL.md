@@ -50,11 +50,11 @@ The unit's temperature display mode can typically be changed in the settings men
 | 64 | Compressor frequency | Hz | |
 | 65 | Fan frequency | Hz | |
 | 66 | EEV opening | steps | |
-| 68 | AC voltage (post-PFC stage) | V | ~238V idle, ~243V compressor running. RISES under load — measured after the power-factor-correction boost stage, not raw line voltage. Useful brownout/P8-P10/P26 early warning. |
-| 69 | Compressor load metric | — | Scales ~1.5-1.7× compressor Hz (78 at 42Hz, 120 at 70Hz observed); hypothesis = input current ×0.1A |
-| 70 | Active heating indicator | — | Non-zero when compressor running and heat transferring; mirrors compressor load |
-| 71 | Refrigerant temp | — | Varies with compressor load; point in refrigerant circuit TBD |
-| 72 | Energy total | ×0.01 kWh | |
+| 68 | **AC line voltage** | V | RMS mains. Measured over two full runs: idle mean 236.9V, running mean 237.3V — **no load-dependent rise**. Useful brownout / P8-P10 / P26 early warning. (An earlier revision of this document claimed reg 68 was post-PFC and rose under load. That was wrong; the PFC bus is reg 72.) |
+| 69 | **AC input current** | ×0.1 A | Confirmed against an external power meter, 1499 samples: `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702, vs `W = 22.09 × reg69`, r²=0.9594. Including line voltage improves the fit — the signature of a current, not a power. Measured scale 0.095 A/count vs nominal 0.1; see caveat below. |
+| 70 | Activity index — **scale undecoded** | — | Hard-gated to 0 with the compressor; ramps 26→60 within 30s of start. **Not** a power proxy (r²=0.59 vs measured input power). Within a 1h window tracks reg 69 at r² 0.6–0.94, but the slope wanders 0.12–0.44 and the mean drifts upward with condensing temperature — consistent with compressor motor current under rising lift. Reliable as a boolean (non-zero = transferring heat); do not scale it. |
+| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. Medium-high confidence; not yet checked against a gauge set. |
+| 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
 | 74 | Ambient temp | °F | |
 | 75 | Coiler temp (outdoor evaporator) | °F | |
 | 76 | Incoiler temp (indoor heat exchanger) | °F | |
@@ -65,6 +65,98 @@ The unit's temperature display mode can typically be changed in the settings men
 | 81 | Water tank sensor | signed | -58 = sensor not installed (E14, cosmetic) |
 | 83 | State flag | — | Always 1 when powered; purpose unknown |
 | 84 | **Inlet water temp** | °F | Confirmed against OEM display |
+
+### Registers 272-275 — static constants
+
+| Register | Value | Status |
+|---|---|---|
+| 272 | 998 | **Static.** Previously labelled "runtime counter" — it is not. Unchanged across 5 days of logging including a full 8.5h run. |
+| 273 | 0 | Empty |
+| 274 | 86 | **Static.** Previously labelled "low-side pressure" — it is not. |
+| 275 | 90 | **Static.** Previously labelled "high-side pressure" — it is not. |
+
+These almost certainly hold model/config constants. They are still polled
+once a minute on the chance they move during an E05/E06 pressure fault,
+which is the only condition under which they have not yet been observed.
+
+### Caveat on the reg 69 current scale
+
+Regressed against an external clamp meter the scale comes out **0.095 A per
+count**, not the 0.1 that the register's granularity implies. That is a
+systematic ~5% disagreement between the controller's own current sensing
+and the reference meter, reproduced on two separate runs — it is not noise.
+Which of the two is off has not been established. If you need absolute
+current, calibrate against your own meter; if you need a relative load
+signal, the register is excellent (r² > 0.97).
+
+### Command and status block (registers 0-40)
+
+Decoded 2026-09-10 by commanding a shutdown and a restart while logging at 5s
+resolution. Every value here **leads** the physical event it describes — these
+are command words, not measurements of what the machine is doing.
+
+| Register | Purpose | Values |
+|---|---|---|
+| **0** | Run demand bitfield | `0x1000` (bit 12) set = unit commanded to run, `0` = commanded off. Set/cleared within 5s of the on/off write, ~140s before the compressor actually moves. |
+| **1** | Run demand bitfield | `0x20` (bit 5) set = commanded to run, `0` = off. Moves in lockstep with reg 0. |
+| **25** | Command bitfield | bit 6 `0x40` = run demand; bit 1 `0x02` = fan commanded. Idle `0`, dwell `0x40` (64), running `0x42` (66). |
+| **26** | Command bitfield | bit 5 `0x20` = fan commanded; bit 0 `0x01` = compressor commanded. Idle `0`, fan only `0x20` (32), running `0x21` (33). |
+| **30** | Static | 28 on this firmware. Did not move across a full stop/start cycle — despite the value, it is **not** a mirror of the 785 state echo. |
+| **33**, **34** | Unpopulated sensor inputs | Both read `-1` (`0xFFFF`) as S_WORD. Same convention as reg 81's -58 for the absent tank sensor. Read these as signed. |
+| **36** | Static | 1. |
+| **39** | **Compressor demand frequency** | Hz. The control law's output — what the controller *wants*. Steps directly to the new target. |
+| **40** | **Ramp-limited frequency setpoint** | Hz. What is actually fed to the inverter. Rate-limited to **5 Hz per 5 s on deceleration**; on acceleration it steps straight to the demand and the drive's own ramp limits the actual. |
+
+Reg 64 (compressor frequency) is the measured actual, which chases reg 40.
+The three together are the full inverter control chain: **39 demand → 40 ramp →
+64 actual**.
+
+#### Observed shutdown sequence
+
+`t=0` is the power-off write. Compressor was at 78 Hz.
+
+```
++5.1  reg 0   4096 -> 0      demand cleared immediately
++5.1  reg 1     32 -> 0
++5.3  reg 39    78 -> 35     demand drops straight to the 35 Hz minimum
++5.3  reg 40    78 -> 74     ramp begins
+      reg 40 then steps 74,69,64,59,54,49,44,39,35 at exactly 5.0s intervals
+      reg 64 follows from just above: 77,76,72,64,60,56,52,44,40,36
++50.2 reg 39/40 35 -> 0
++55.1 reg 26    33 -> 32     compressor command bit clears
++55.3 reg 64    36 -> 0      compressor stops, 0.2s later
++141  fan 0                  84s post-run fan purge, then reg 25/26 -> 0
+```
+
+#### Observed startup sequence
+
+`t=0` is the power-on write, after an 11.8 minute off period.
+
+```
++4.1   reg 0/1   -> 4096/32   demand set, 140s before anything moves
++4.2   reg 25    -> 64        bit 6 run demand
++108.8 reg 785 34 -> 35       enters startup dwell
++124.1 reg 25 64 -> 66        bit 1 fan commanded
++124.1 reg 26  0 -> 32        bit 5 fan commanded
++129.3 fan       -> 22        fan spins, 5.2s AFTER the command bits
++139.2 reg 39/40 -> 42        demand and setpoint together, no ramp on the way up
++144.1 reg 26 32 -> 33        bit 0 compressor commanded
++144.4 reg 64    -> 30        compressor starts, 0.3s AFTER the bit
++154.3 reg 72 328 -> 347      PFC engages
++159.3 reg 72 347 -> 378      running bus voltage
++174..184 reg 64 30->34->38->42  actual climbs to demand
+```
+
+The restart delay is enforced between the demand bits being set and the fan
+being commanded — roughly 120s here, within the 3-5 minute window the manual
+describes.
+
+**Why regs 0 and 1 matter most.** They are single bits set in otherwise-empty
+16-bit words at the very bottom of the address space. That is the shape of a
+status/fault bitmap, and it is the most promising place yet found for the
+undecoded E-codes and the defrost flag. Bit 12 of reg 0 and bit 5 of reg 1 are
+now known to mean "run demand"; the remaining 30 bits are unmapped because
+this unit has not faulted.
 
 ### Protection status registers (96-99)
 
@@ -133,6 +225,38 @@ The following register ranges consistently return 0 on this firmware:
 - Registers 2058-2059
 
 Other firmware versions may use some of these ranges.
+
+### Survey status
+
+Ranges 0-59 and 786-800 were swept on 2026-09-10 with
+`tools/register-survey.yaml`, across a commanded shutdown and restart. Results
+are in the command/status block above. The bus answered cleanly throughout —
+no Modbus exceptions — so these are real, implemented registers.
+
+Of the 60 registers in 0-59, twelve are live: 0, 1, 25, 26, 29, 30, 33, 34,
+36, 39, 40. In 786-800, only 786 (constant 26). Everything else reads zero.
+
+Since v1.4.0 the **production config captures 0-59 every cycle** as a single
+frame, so the overlay is no longer needed for these ranges. Decoded registers
+go to named sensors; every other non-zero value lands in the `Raw Register
+Map` text sensor, which Home Assistant records only when it changes. Two
+further sensors, `Last Defrost` and `Last Fault Snapshot`, latch the full map
+plus surrounding conditions at the instant those events begin — a defrost
+lasts minutes and then everything returns to normal, so the snapshot is what
+makes the event legible afterwards.
+
+Still never read: 165-255, 296-375, 558-767, 801-2047. No particular reason to
+expect content there. `tools/register-survey.yaml` remains the tool for
+sweeping them — edit `SURVEY_RANGES`.
+
+**Coverage was never the bottleneck.** A register that does not change teaches
+nothing, and this unit is healthy: 96/97/99 have read 1 continuously,
+272/274/275 have never moved, no E-code has fired. The first sweep of an idle
+machine returned a page of constants and looked empty; the same registers gave
+up a complete inverter control chain the moment the unit was made to change
+state. Any future decoding depends on catching **transitions**, and above all
+a fault or a defrost cycle. Defrost needs the outdoor coil below freezing —
+in a warm climate, a winter capture.
 
 ## Write operations
 
@@ -210,7 +334,7 @@ The 0x0311 register (decimal 785) reflects current operational state:
 | 32 | 0x20 | Idle (powered on, compressor off, flow present) |
 | 33 | 0x21 | Running steady — heat mode (higher load) |
 | 34 | 0x22 | Transitional |
-| 35 | 0x23 | Cool mode related |
+| 35 | 0x23 | **Startup dwell (heat mode)** — observed throughout the restart delay and the initial low-load ramp on 2026-09-10. An earlier revision listed this as "cool mode related"; that was wrong. |
 
 **Note:** 0x1D is used across multiple states — protection mode, startup dwell, and normal running at low load. It is **not reliable as a fault indicator** on its own. Combine with reg 29 and compressor frequency for full state assessment.
 
@@ -232,7 +356,21 @@ To find it, watch the diagnostic register dumps during a defrost event. Defrost 
 - Brief reversal of inlet/outlet water delta T
 - The Tuya app showing "Defrosting"
 
-If you capture a defrost event with this integration and identify which register changes, please contribute the finding back — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+**Since v1.4.0 this is instrumented.** The `Defrosting` binary sensor infers
+the cycle from the physical signature — compressor turning while the outdoor
+fan is stopped, heat mode only — without needing a register at all. In every
+run logged, the fan has never been at zero while the compressor turns, so the
+combination is unambiguous. When it fires, `Last Defrost` latches the
+compressor, fan, coil, ambient, suction, discharge and condensing
+temperatures, the EEV position, **and the full 0-59 register map**, and logs
+the lot at WARN.
+
+So the real defrost flag, if one exists, will identify itself the first time
+the unit defrosts: compare the latched register map against the healthy
+baseline documented in the command block above. In a warm climate that means
+waiting for winter — the outdoor coil has to be below freezing.
+
+If you capture a defrost event and identify which register changes, please contribute the finding back — see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## OEM fault code reference
 
@@ -393,11 +531,30 @@ commands are never sent, so the retry counter never moves).
 ### Frame count guidance
 
 Bus time is dominated by per-frame throttle slots, not data bytes. A
-21-register read costs one `command_throttle` slot — the same as a
-1-register read. When adding sensors, pad gaps with `internal: true`
-sensors so contiguous blocks read as single frames. The v1.2.0 config
-reads regs 29, 64-84, 96-99, 768-779, and 785 in five frames per
-cycle (plus 272-275 every 12th cycle).
+A 21-register read costs one `command_throttle` slot — the same as a
+1-register read. Modbus allows up to **125 registers per read**, so a wide
+contiguous block is nearly free while a scattered handful is not. When adding
+sensors, pad gaps with `internal: true` sensors so contiguous blocks read as
+single frames.
+
+The v1.4.0 config reads, per 5s cycle:
+
+| Frame | Registers |
+|---|---|
+| 1 | 0-59 (the whole command block, one frame) |
+| 2 | 64-84 |
+| 3 | 96-99 |
+| 4 | 768-779 |
+| 5 | 785 |
+| 6 | 29 |
+
+plus 272-275 and 786-800 every 12th cycle. Six frames at 100ms throttle is
+600ms of a 5000ms cycle.
+
+Capturing all sixty registers of the command block therefore costs about what
+a single register costs. That is the whole reason the v1.4.0 event capture is
+affordable: there is no cheaper way to be watching when a fault or a defrost
+finally happens than to read the entire block every cycle.
 
 ## Validation methodology
 

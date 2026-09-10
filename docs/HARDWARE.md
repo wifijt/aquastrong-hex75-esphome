@@ -47,6 +47,47 @@ The Aquastrong HEX 75 controller (CHICO SMBPRO53, board `R-SY013-BP`) has multip
 | A | A |
 | B | B |
 
+**COM2 has no ground pin — you must take one from elsewhere on the board.**
+See below. This is not optional.
+
+### Signal ground — required
+
+RS-485 is differential, which leads people to assume two wires are enough.
+They are not. The transceivers at each end only work if they agree on what
+"zero volts" means, to within roughly **-7 V to +12 V** for a standard MAX485.
+An ESP running from its own USB brick shares no reference with the controller,
+so that common-mode voltage is free to wander — and in a cabinet containing a
+compressor VFD, it does.
+
+The failure is nasty because it is not clean. You get intermittent CRC errors
+that look like ordinary EMI, worse under compressor load, sometimes working
+fine on the bench and failing once installed. Left long enough at the extreme,
+it damages the transceiver.
+
+COM2 gives you A and B only, so ground must come from another low-voltage
+point on the controller:
+
+| Source | Notes |
+|---|---|
+| **COM4 display connector GND pin** | The JST header feeding the OEM display carries a ground. Easiest tap — verify with a meter against COM2's A/B before committing. |
+| **Any labeled `GND` / `0V` terminal** on a low-voltage header | Equally valid. |
+| Board ground plane / mounting standoff | Last resort, and only if you can confirm continuity to logic ground. |
+
+> [!WARNING]
+> Use a **low-voltage logic ground from the controller board**. Never use
+> mains earth, neutral, or the chassis as your RS-485 reference. Confirm with
+> a meter that the point you have chosen sits at 0 V relative to the
+> controller's logic supply before connecting anything.
+
+If you power the ESP from the controller's own low-voltage supply, ground is
+already common and you need no extra wire — but confirm that, do not assume it.
+
+Best practice is a **100 Ω resistor in series** with the ground wire rather
+than a hard connection. It still establishes the reference while limiting
+circulating current if the two supplies sit at slightly different potentials.
+A direct connection works and is what most installs use; the resistor is
+cheap insurance.
+
 ### MAX485 to ESP32-C6
 
 ![ESP32-C6 and MAX485 module wired](../images/esp32_wiring.jpeg)
@@ -76,10 +117,11 @@ The compressor and fan motors in the heat pump produce EMI that can corrupt RS-4
 
 If error rate exceeds ~5 per second during operation:
 
-1. **Twist the A/B pair** if not already twisted. Untwisted parallel runs are antennas.
-2. **Use shielded cable**. Ground the shield at the ESP end only (not both — creates ground loops).
-3. **Route cable away from AC wiring**, especially the compressor and fan motor leads. Even a few inches of separation helps.
-4. **Add a clip-on ferrite bead** near the heat pump end of the cable.
+1. **Check the signal ground first.** A missing or poor reference back to the controller board produces exactly this symptom and is far more common than genuine EMI. See "Signal ground" above.
+2. **Twist the A/B pair** if not already twisted. Untwisted parallel runs are antennas.
+3. **Use shielded cable**. Ground the shield at the ESP end only (not both — creates ground loops). The shield is not a substitute for the signal ground wire.
+4. **Route cable away from AC wiring**, especially the compressor and fan motor leads. Even a few inches of separation helps.
+5. **Add a clip-on ferrite bead** near the heat pump end of the cable.
 
 The ESPHome modbus_controller component retries failed reads automatically, so transparent recovery is the norm even with some CRC noise. The integration's write-confirmation logic is also fault-tolerant.
 
@@ -101,6 +143,6 @@ Earlier attempts tried sharing COM4 with the display by intercepting the JST con
 Before powering up the ESP:
 
 1. Confirm A and B aren't swapped (RS-485 won't communicate if reversed)
-2. Confirm GND is connected — RS-485 is differential but the transceivers still need a common reference
+2. Confirm the signal ground is connected **back to the controller board**, not just to the ESP's own supply — RS-485 is differential but the transceivers still need a shared reference. See "Signal ground" above; this is the single most common cause of intermittent CRC errors.
 3. Confirm 5V/3.3V to the MAX485 matches your module's spec
 4. Confirm the OEM display still works after you've connected the ESP to COM2 (it should — different ports)

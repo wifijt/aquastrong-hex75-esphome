@@ -1,0 +1,289 @@
+# ============================================================================
+# TEMPORARY register survey overlay — flash, capture, flash back
+# ----------------------------------------------------------------------------
+# Sweeps the register ranges that have never been surveyed on this controller
+# and logs every value every 30s, so you can watch which ones MOVE as the unit
+# changes state. A static dump tells you almost nothing; a register that
+# changes when the compressor starts, when a fault trips, or during a defrost
+# cycle is the whole point.
+#
+# WHY THESE RANGES
+#   0-59    Reg 29 (flow/fault status) sits alone in an otherwise unexamined
+#           neighbourhood. On these OEM boards the fault-code block is almost
+#           always contiguous with the status word, so 0-28 and 30-59 are the
+#           highest-probability location for the undecoded E-codes.
+#   786-800 Immediately past the 785 state echo, at the top of the control
+#           block. Second-most-likely spot for mode/state flags.
+#
+# HOW TO USE
+#   1. Copy this file and config/pool-heatpump.yaml into your ESPHome config
+#      directory (they must sit side by side).
+#   2. Install THIS file. It pulls the production config in as a package, so
+#      every normal entity, control and safety behaviour stays live — you do
+#      not lose control of the heater while surveying.
+#   3. Open the log stream and leave it running. Capture, at minimum:
+#        - several minutes with the unit OFF
+#        - the compressor start transition
+#        - steady-state running
+#        - the shutdown transition
+#      If you ever catch a fault or a defrost cycle, that capture is gold.
+#   4. Re-install config/pool-heatpump.yaml to return to normal.
+#
+# COST
+#   Three extra Modbus frames every 30s, against a 5s poll cycle that already
+#   uses five. Negligible, but this is deliberately NOT in the production
+#   config — surveying unmapped registers is a diagnostic activity, not
+#   something to run forever on the device that controls your heater.
+#
+# A WARNING ABOUT UNMAPPED REGISTERS
+#   Registers the controller does not implement may return a Modbus exception
+#   rather than zeros. ESPHome logs those as errors and the range is skipped.
+#   That is informative in itself — an exception means "no register here",
+#   while a zero means "register exists, currently zero". If a whole range
+#   throws exceptions, drop it from SURVEY_RANGES below rather than letting it
+#   retry every 30s.
+# ============================================================================
+
+packages:
+  base: !include pool-heatpump.yaml
+
+esphome:
+  name_add_mac_suffix: false
+
+logger:
+  level: INFO
+  logs:
+    survey: INFO
+    modbus_controller: WARN
+
+# 5s sweep. The production poll cycle is also 5s and uses five frames; three
+# more per cycle is 800ms of bus time out of 5000ms. Deliberately fast because
+# the transitions worth capturing are short - a compressor spin-down completes
+# in about 25 seconds, so a 30s sweep resolves it as one before and one after
+# sample and tells you nothing about sequence. Turn this back down to 30s for
+# long unattended captures where you only care about slow state.
+# NOTE: registers 0-59 and 786-800 are now captured by the PRODUCTION config
+# as of v1.4.0 - you do not need this overlay for them. It remains useful for
+# sweeping the still-unexplored ranges (165-255, 296-375, 558-767, 801-2047):
+# edit SURVEY_RANGES below.
+# 30s raw sweep.
+# register that reads zero today but wakes up during a fault or a defrost is
+# still caught. The promoted sensors below cover the 11 already known live at
+# the 5s poll rate, with recorder history. Belt and braces.
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          // Ranges to sweep: {first register, how many}. Modbus allows up to
+          // 125 registers per read, but keeping chunks small means one bad
+          // range does not blind the others.
+          struct SurveyRange { uint16_t start; uint16_t count; };
+          static const SurveyRange SURVEY_RANGES[] = {
+            {0,   30},
+            {30,  30},
+            {786, 15},
+          };
+
+          static uint32_t sweep = 0;
+          sweep++;
+
+          for (auto &r : SURVEY_RANGES) {
+            auto handler = [](esphome::modbus_controller::ModbusRegisterType,
+                              uint16_t start_address,
+                              const std::vector<uint8_t> &data) {
+              // Response payload is big-endian 16-bit words. Emit compact
+              // "addr=value" pairs, skipping zeros so the interesting values
+              // are not buried — a fully zero range prints as "(all zero)".
+              std::string line;
+              char buf[24];
+              size_t nonzero = 0;
+              for (size_t i = 0; i + 1 < data.size(); i += 2) {
+                uint16_t v = (uint16_t(data[i]) << 8) | uint16_t(data[i + 1]);
+                if (v == 0) continue;
+                nonzero++;
+                snprintf(buf, sizeof(buf), "%u=%u ",
+                         (unsigned) (start_address + i / 2), (unsigned) v);
+                line += buf;
+              }
+              if (nonzero == 0) {
+                ESP_LOGI("survey", "[%u..%u] (all zero)",
+                         (unsigned) start_address,
+                         (unsigned) (start_address + data.size() / 2 - 1));
+              } else {
+                ESP_LOGI("survey", "[%u..%u] %s",
+                         (unsigned) start_address,
+                         (unsigned) (start_address + data.size() / 2 - 1),
+                         line.c_str());
+              }
+            };
+
+            auto cmd = esphome::modbus_controller::ModbusCommandItem::create_read_command(
+                id(heatpump),
+                esphome::modbus_controller::ModbusRegisterType::HOLDING,
+                r.start, r.count, std::move(handler));
+            id(heatpump)->queue_command(cmd);
+          }
+
+          // Context line so a log capture can be correlated with unit state
+          // without cross-referencing Home Assistant history afterwards.
+          ESP_LOGI("survey",
+                   "--- sweep %u | power=%d mode=%d comp=%.0fHz fan=%.0fHz "
+                   "flow=%.0f in=%.0fF out=%.0fF ---",
+                   (unsigned) sweep, id(cache_power), id(cache_mode),
+                   id(reg_comp_freq).has_state() ? id(reg_comp_freq).state : -1.0f,
+                   id(reg_fan_freq).has_state() ? id(reg_fan_freq).state : -1.0f,
+                   id(reg_fault).has_state() ? id(reg_fault).state : -1.0f,
+                   id(reg_inlet_water).has_state() ? id(reg_inlet_water).state : -1.0f,
+                   id(reg_outlet_water).has_state() ? id(reg_outlet_water).state : -1.0f);
+
+# ============================================================================
+# The registers found live in the first capture, promoted to real sensors so
+# Home Assistant's recorder stores them. The log sweep alone lives only in the
+# log stream - it dies with whatever is tailing it. The recorder writes only on
+# CHANGE, so a register that sits constant costs essentially nothing, while the
+# ones that move during a transition are timestamped and queryable afterwards.
+# Signed (S_WORD) because 33/34 read 65535, which is -1: unpopulated sensor
+# inputs, the same convention as reg 81's -58 for the absent tank sensor.
+# Padding registers keep each group to a single Modbus frame.
+# These are TEMPORARY. They orphan when you reinstall pool-heatpump.yaml.
+# ============================================================================
+sensor:
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 0"
+    address: 0
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 1"
+    address: 1
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 25"
+    address: 25
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 26"
+    address: 26
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_27
+    address: 27
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_28
+    address: 28
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 30"
+    address: 30
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 33"
+    address: 33
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 34"
+    address: 34
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_35
+    address: 35
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 36"
+    address: 36
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_37
+    address: 37
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_38
+    address: 38
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 39"
+    address: 39
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 40"
+    address: 40
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 786"
+    address: 786
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan

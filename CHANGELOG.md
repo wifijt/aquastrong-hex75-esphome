@@ -1,5 +1,155 @@
 # Changelog
 
+## v1.4.0 — Command block in production, event capture
+
+Promotes the register 0-59 decode from the temporary survey overlay into the
+shipped config, and adds the machinery to catch a defrost cycle or an E-code
+the first time one happens.
+
+### The whole command block, for one Modbus frame
+
+Registers 0-59 are read as a single frame — the protocol allows 125 registers
+per read, so capturing all sixty costs about what the existing single reg 29
+read costs. 786-800 is polled once a minute (it is static).
+
+### New sensors
+
+| Sensor | Register | Notes |
+|---|---|---|
+| **Compressor Demand** (Hz) | 39 | The control law's output — what the controller *wants*. This is the register that explains behaviour: why the unit sits at 52 Hz instead of 78 is visible here and nowhere else. |
+| **Compressor Setpoint** (Hz) | 40 | What is fed to the inverter. Rate-limited to 5 Hz per 5 s on deceleration; steps straight to demand on acceleration. Compare against Compressor Frequency (reg 64, measured actual) to watch the drive track. |
+| **Command Bits 0 / 1 / 25 / 26** | 0, 1, 25, 26 | Command bitfields. Every bit *leads* its physical event — the fan bit sets ~5 s before the fan spins, the compressor bit ~0.3 s before it turns. Diagnostic. |
+
+### Event capture
+
+- **Raw Register Map** — every non-zero register in 0-59 as one compact
+  string. Forty-four of those sixty read zero on a healthy unit; if any wakes
+  up during a defrost or a fault, Home Assistant records the exact moment.
+  One entity instead of sixty, and the recorder only writes a row when the
+  string *changes* — which is precisely when a register changed.
+- **Last Defrost** — latches compressor/fan/coil/ambient/suction/discharge/
+  condensing/EEV plus the full register map at the moment defrost starts, and
+  logs it at WARN. A defrost lasts minutes and then everything returns to
+  normal; this keeps the event legible months later. **If a defrost flag
+  register exists, it will be in the map captured here.**
+- **Last Fault Snapshot** — the same for a protection trip, latched on first
+  occurrence so the identifying registers survive the fault clearing.
+
+### Why this shape
+
+Registers 0 and 1 hold single bits in otherwise-empty 16-bit words at the
+bottom of the address space — the shape of a fault bitmap. Bit 12 of reg 0 and
+bit 5 of reg 1 mean "run demand". The remaining 30 bits are unmapped only
+because this unit has not faulted. Recording the whole block continuously is
+the only way to map them without being present when something goes wrong.
+
+## v1.3.0 — Register decode corrections
+
+Three registers were carrying wrong labels. All corrections below were
+established by regression against an external power meter on the heat pump
+feed and against whole-pool energy balance, over two full run cycles
+(1499 sampled points), then reproduced on a third.
+
+### Corrected registers
+
+| Reg | Was | Is | Evidence |
+|---|---|---|---|
+| 72 | `Energy Total` (kWh, ×0.01) | **DC bus voltage** (V) | Idle 336 = √2 × 237Vac; running 377–380 regulated; precharge dip to 327 on start; back to 336 within 5s of stop. Never accumulates. |
+| 69 | `Compressor Load` (raw) | **AC input current** (×0.1 A) | `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702 — beats the pure-power fit, the signature of a current. |
+| 71 | `Refrigerant Metric` (raw) | **Condensing temp** (°F) | Idle equalises between water and ambient; running mean 101; collapses 104→78 within 2 min of shutdown. |
+
+**If you were feeding reg 72 into the HA energy dashboard, remove it.** It
+was never energy — the values are bus volts, and they do not accumulate.
+
+### Corrected labels (no functional change)
+
+- Regs 272 / 274 / 275 were labelled `Runtime Counter` / `Pressure A` /
+  `Pressure B`. All three are **static constants** (998 / 86 / 90),
+  unchanged across 5 days of logging including a full 8.5h run. Renamed to
+  `Static Reg N` and marked diagnostic. Still polled once a minute in case
+  they move during an E05/E06 pressure fault.
+- Reg 70 keeps the name `Active Heating` — the boolean derivative is
+  correct — but the scalar is explicitly **not decoded**. It is not a power
+  proxy (r²=0.59 against measured input power). Do not scale it.
+- `docs/PROTOCOL.md` claimed reg 68 was post-PFC and rose under load. It
+  does not: idle mean 236.9V, running mean 237.3V. It is plain RMS line
+  voltage. The PFC bus is reg 72.
+
+### New
+
+- **Input Apparent Power** (VA), derived as reg 68 × reg 69. Exact by
+  definition; matched the reference meter at r²=0.9702.
+- **Evaporator Superheat** (°F) = suction − coiler. Measured 2–3 °F and
+  rock steady across every run logged; a sustained drift means charge or
+  expansion valve.
+- **Discharge Superheat** (°F) = discharge − condensing. Observed 85→68 °F
+  on one run, 62→56 °F on another. A rising trend at matched conditions is
+  the classic undercharge signature.
+- **Condenser Approach** (°F) = condensing − outlet water. Observed 13–18 °F
+  on one run and 24–25 °F on another at identical compressor speed and
+  input power. Probably explained by the higher ambient raising capacity —
+  but if it climbs at matched conditions it means fouling or reduced flow,
+  and the reg 71 decode needs revisiting.
+- **Defrosting** (binary). This controller has no known defrost register and
+  does not need one: defrost stops the outdoor fan while the compressor
+  keeps running, and in every run logged the fan has never been at zero
+  while the compressor turns. Heat mode only, 30s debounce both ways.
+- **Protection Status** (text). Names whichever of regs 96/97/98/99 is low.
+  96/97/99 have read 1 continuously for the life of this integration, so
+  this is the mechanism by which we will finally learn what they mean.
+
+All of the above are derived from registers already polled — no additional
+Modbus frames.
+
+### Register survey results (docs only)
+
+Ranges 0-59 and 786-800 — never previously read — were swept across a
+commanded shutdown and restart. This decoded the inverter control chain:
+
+- **reg 39** = compressor demand frequency (the control law's output)
+- **reg 40** = ramp-limited setpoint, rate-limited to **5 Hz per 5 s on
+  deceleration**; steps directly to demand on acceleration
+- **reg 64** (already known) = measured actual, chasing reg 40
+- **regs 0, 1, 25, 26** = command bitfields. Every bit *leads* the physical
+  event: the fan command bit sets 5.2s before the fan spins, the compressor
+  bit 0.3s before the compressor turns.
+- **regs 33, 34** = unpopulated sensor inputs, reading -1 as S_WORD
+- **regs 30, 36, 786** = static constants
+
+Regs 0 and 1 are single bits in otherwise-empty 16-bit words at the bottom of
+the address space — the shape of a fault bitmap, and the most promising place
+yet found for the undecoded E-codes and the defrost flag. Bit 12 of reg 0 and
+bit 5 of reg 1 mean "run demand"; the other 30 bits are unmapped because this
+unit has not faulted.
+
+Also corrects the 785 state map: value 35 was listed as "cool mode related".
+It is the heat-mode startup dwell, observed throughout a restart delay.
+
+None of this changes the shipped config — see `tools/register-survey.yaml` to
+reproduce it.
+
+### Home Assistant metadata
+
+Every sensor now declares `device_class` / `state_class` / `accuracy_decimals`
+where applicable (15 / 17 / 16 respectively). Previously none did, which
+meant **no long-term statistics for any sensor** — no history graphs beyond
+the recorder window, no unit conversion, no energy dashboard eligibility.
+Protection bits, running state and the static registers are now
+`entity_category: diagnostic`.
+
+### Fixed
+
+- The restart button was named `"${friendly_name} Restart"` with no
+  `substitutions:` block, so the literal `${friendly_name}` reached Home
+  Assistant. Now `"Restart"`, which ESPHome prefixes automatically.
+
+### Upgrading
+
+Renaming a sensor changes its entity ID and orphans the old entity. Affected:
+`energy_total`, `compressor_load`, `refrigerant_metric`, `runtime_counter`,
+`pressure_a`, `pressure_b`, and the restart button. Update any dashboard
+cards, automations or templates that reference them before flashing.
+
 ## v1.2.0 — Bus resilience under EMI / ESPHome 2026.3.0+ compatibility
 
 ### Critical fix: TX starvation on ESPHome 2026.3.0+

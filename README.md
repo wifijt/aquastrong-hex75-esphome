@@ -14,11 +14,22 @@ This project replaces the Tuya cloud integration with a fully local, fully contr
 > the compressor is running**. See docs/PROTOCOL.md and the v1.2.0
 > changelog for the full analysis.
 
+> [!IMPORTANT]
+> **Tie the ESP's ground to the controller board.** COM2 provides A and B
+> only. RS-485 needs a shared voltage reference, so take a ground from
+> another low-voltage point on the controller — the COM4 display connector's
+> GND pin is the usual tap. Skipping this is the most common cause of
+> intermittent CRC errors, and it fails in the worst way: fine on the bench,
+> flaky once the compressor runs. Never use mains earth or chassis for this.
+> See [docs/HARDWARE.md](docs/HARDWARE.md#signal-ground--required).
+
 ## What you get
 
 - **Full local control**: power, mode (Cool/Heat/Auto), all three setpoints, energy mode (Standard/Boost/Eco)
-- **Complete sensor visibility**: water inlet/outlet, refrigerant circuit, compressor and fan frequencies, EEV opening, energy usage
-- **Fault detection**: water flow protection and other faults exposed as binary sensors
+- **Complete sensor visibility**: water inlet/outlet, full refrigerant circuit, compressor and fan frequencies, EEV opening, AC line voltage and input current, DC bus voltage
+- **Derived diagnostics**: evaporator and discharge superheat, condenser approach, input apparent power — the numbers you would otherwise need a gauge set and a clamp meter for
+- **Inverter control chain**: compressor demand vs. ramp-limited setpoint vs. measured actual, so you can see *why* the unit is running at the speed it is
+- **Fault and defrost capture**: protection bits, a defrost detector, and latched snapshots of the full register map at the moment an event begins
 - **No cloud required**: Tuya can be left disabled or removed entirely
 - **Coexists with the OEM display and Tuya app**: three independent control surfaces stay in sync
 
@@ -44,12 +55,12 @@ If you have a CHICO board with the same dual COM port layout, this should be a s
 
 ## How it works
 
-The heat pump exposes several RS-485 ports on the controller these are the ones identified:
+The controller exposes several RS-485 ports. These are the two that matter:
 
 | Port | Original use | What we use it for |
 |------|-------------|---------------------|
-| COM4 | Touchscreen display (JST connector) | Display stays here, untouched |
-| COM2 | Auxiliary terminal block | ESP32 connects here for read/write |
+| COM4 | Touchscreen display (JST connector) | Display stays here, untouched — but its GND pin is the usual signal-ground tap |
+| COM2 | Auxiliary terminal block (A/B only) | ESP32 connects here for read/write |
 
 ![Control board overview](images/control_board.jpeg)
 *The CHICO R-SY013-BP control board. The PCB part number is visible near the bottom center. The green screw terminal block (COM2) is at the bottom edge.*
@@ -75,7 +86,6 @@ The Tuya WiFi module reports state to the cloud independently — if you want to
 2. **Protocol reference** — see [docs/PROTOCOL.md](docs/PROTOCOL.md) for the Modbus map (useful if you need to adapt to a slightly different unit)
 3. **Install ESPHome config** — copy [config/pool-heatpump.yaml](config/pool-heatpump.yaml) and edit your WiFi/API credentials in `secrets.yaml`
 4. **Flash and verify** — see [docs/INSTALL.md](docs/INSTALL.md) for the full procedure
-5. **Optional dashboard examples** — see [examples/](examples/) for Lovelace cards and automations
 
 ## Status
 
@@ -83,10 +93,14 @@ The Tuya WiFi module reports state to the cloud independently — if you want to
 |---|---|
 | Read sensors | ✅ Production |
 | Write controls | ✅ Production with confirmation/retry |
-| Fault detection | ✅ Water flow confirmed, others TBD |
-| Defrost mode detection | ❌ Not yet identified (see PROTOCOL.md) |
+| Bus resilience under compressor EMI | ✅ Production (see the ESPHome warning above) |
 | Dual-bus isolation | ✅ Tested and working |
-| Documentation | 🚧 Initial release |
+| Inverter control chain (demand / setpoint / actual) | ✅ Decoded |
+| Electrical sensing (line voltage, input current, DC bus) | ✅ Decoded |
+| Defrost detection | ✅ Inferred from fan-stopped-while-compressor-runs; no register needed |
+| Defrost *register* | ❓ Still unidentified — instrumented and waiting for a cold-weather event |
+| Fault detection | 🚧 Water flow (E03) confirmed; other protection bits instrumented but never yet tripped |
+| Command bitfields (regs 0, 1, 25, 26) | 🚧 Run/fan/compressor bits known; remaining bits unmapped |
 
 ## Known limitations
 
@@ -94,6 +108,7 @@ The Tuya WiFi module reports state to the cloud independently — if you want to
 - Register addresses were reverse-engineered from snooping the display ↔ controller protocol; firmware updates may change them
 - Some registers' purposes are still unknown — see [PROTOCOL.md](docs/PROTOCOL.md) for what's known
 - Modifies hardware: requires opening the unit and adding wiring to the auxiliary RS-485 port — **understand your warranty implications**
+- Requires a signal ground tapped from the controller board; COM2 does not provide one
 
 ## Acknowledgements
 
@@ -114,7 +129,14 @@ MIT — see [LICENSE](LICENSE). Use at your own risk. The author accepts no resp
 PRs welcome. Especially valuable:
 
 - **Confirmed compatibility** with other CHICO-based units (Fairland, IPS, etc.)
-- **Defrost mode detection** — the Tuya app shows a "Defrosting" status but the register hasn't been identified yet
-- **Additional fault code bits** decoded
-- **Improved register identification** for unknowns (regs 68, 69, 71, 83)
+- **A captured fault or defrost event.** This is the most valuable thing anyone
+  can contribute. The config latches the full register map the moment either
+  begins — if yours ever trips, that snapshot very likely identifies registers
+  nobody has decoded yet. See `Last Defrost` and `Last Fault Snapshot`.
+- **Command bitfield decoding** — regs 0, 1, 25 and 26 carry bits whose meaning
+  is unknown simply because this unit has stayed healthy
+- **Reg 70**, which is load-related but demonstrably not a power proxy. A clamp
+  meter on a compressor lead during a run would likely settle it
+- **Reg 71 confirmation** against a gauge set — believed to be condensing
+  temperature, not yet verified directly
 - **Lovelace dashboards** and HA automations

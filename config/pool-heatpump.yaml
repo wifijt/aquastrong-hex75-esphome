@@ -23,7 +23,7 @@ esphome:
   friendly_name: Pool Heat Pump
   project:
     name: esphome.pool_heatpump
-    version: "1.2.0"
+    version: "1.4.0"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -287,6 +287,68 @@ text_sensor:
       snprintf(buf, sizeof(buf), "Fault 0x%04X (%d)", f, f);
       return std::string(buf);
 
+  # Conditions latched at the last defrost START. A defrost lasts minutes
+  # then everything returns to normal; this keeps the event legible later.
+  # If a defrost flag register exists, it is in the map captured here.
+  - platform: template
+    name: "Pool Heater Last Defrost"
+    id: last_defrost
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:snowflake-alert
+
+  # Same for a protection trip. 96/97/99 have read 1 for the life of this
+  # integration; this captures what else was true when one goes low.
+  - platform: template
+    name: "Pool Heater Last Fault Snapshot"
+    id: last_fault_snapshot
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:alert-box
+
+  # Every non-zero register in 0-59, as one compact string. The defrost/fault
+  # net: 44 of those 60 read zero on a healthy unit, so anything waking up
+  # shows here with a recorder timestamp. HA writes a row only when the
+  # string changes - precisely when a register changed.
+  - platform: template
+    name: "Pool Heater Raw Register Map"
+    id: raw_register_map
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:map-search
+
+  # Names whichever protection bit is low, so a fault that has never been
+  # observed still identifies itself the first time it happens. 96/97/99
+  # are undecoded - they have read 1 continuously for the life of this
+  # integration - so this sensor is how we will learn what they mean.
+  - platform: template
+    name: "Pool Heater Protection Status"
+    id: protection_status
+    icon: mdi:shield-alert
+    update_interval: 5s
+    lambda: |-
+      if (!id(reg_prot_96).has_state()) return {};
+      std::string out = "";
+      if (id(reg_prot_96).state != 1) out += "96 ";
+      if (id(reg_prot_97).state != 1) out += "97 ";
+      if (id(reg_water_flow).state != 1) out += "98(flow) ";
+      if (id(reg_prot_99).state != 1) out += "99 ";
+      if (out.empty()) return std::string("All OK");
+      std::string msg = std::string("Protection low: ") + out;
+      // Latch the surrounding conditions the first time this trips, so the
+      // registers that identify the fault are not lost when it clears.
+      static bool latched = false;
+      if (!latched) {
+        latched = true;
+        char buf[255];
+        snprintf(buf, sizeof(buf), "%s | flow=%.0f comp=%.0fHz dis=%.0fF regs[%s]",
+                 msg.c_str(), id(reg_fault).state, id(reg_comp_freq).state,
+                 id(reg_discharge).state, id(raw_register_map).state.c_str());
+        id(last_fault_snapshot).publish_state(buf);
+        ESP_LOGE("pool", "PROTECTION TRIP: %s", buf);
+      }
+      return msg;
+
 # ====================================================================
 # Binary sensors
 #
@@ -324,6 +386,44 @@ binary_sensor:
     lambda: |-
       if (!id(reg_water_flow).has_state()) return {};
       return id(reg_water_flow).state == 1;  // 1=flow present, 0=no flow
+
+  # No defrost register is known, and none is needed: defrost stops the
+  # outdoor fan while the compressor keeps running, and the fan has never
+  # been at zero with the compressor turning in any run logged. Heat mode
+  # only. When this fires, "Last Defrost" latches the register map - that
+  # is the opportunity to find the real flag.
+  - platform: template
+    name: "Pool Heater Defrosting"
+    id: defrosting
+    device_class: cold
+    icon: mdi:snowflake-melt
+    lambda: |-
+      if (!id(reg_comp_freq).has_state() || !id(reg_fan_freq).has_state()) return {};
+      return id(cache_mode) == 1 &&
+             id(reg_comp_freq).state > 0 &&
+             id(reg_fan_freq).state < 1;
+    filters:
+      - delayed_on: 30s
+      - delayed_off: 30s
+    on_press:
+      then:
+        - lambda: |-
+            char buf[255];
+            snprintf(buf, sizeof(buf),
+                     "START comp=%.0fHz fan=%.0fHz coil=%.0fF amb=%.0fF suc=%.0fF "
+                     "dis=%.0fF cond=%.0fF eev=%.0f regs[%s]",
+                     id(reg_comp_freq).state, id(reg_fan_freq).state,
+                     id(reg_coiler).state, id(reg_ambient).state,
+                     id(reg_suction).state, id(reg_discharge).state,
+                     id(reg_condensing).state, id(reg_eev).state,
+                     id(raw_register_map).state.c_str());
+            id(last_defrost).publish_state(buf);
+            ESP_LOGW("pool", "DEFROST DETECTED: %s", buf);
+    on_release:
+      then:
+        - lambda: |-
+            ESP_LOGW("pool", "DEFROST ENDED: coil=%.0fF regs[%s]",
+                     id(reg_coiler).state, id(raw_register_map).state.c_str());
 
   - platform: template
     name: "Pool Heater Heating Active"
@@ -561,9 +661,71 @@ interval:
     then:
       - script.execute: check_confirmations
 
+  # ------------------------------------------------------------------
+  # Command block capture: 0-59 every cycle (one frame), 786-800 once a
+  # minute. Decoded registers go to named sensors, the rest to the Raw
+  # Register Map. This is what catches a defrost cycle or an E-code.
+  # ------------------------------------------------------------------
+  - interval: 5s
+    then:
+      - lambda: |-
+          static uint8_t slow = 0;
+
+          auto publish_block = [](esphome::modbus_controller::ModbusRegisterType,
+                                  uint16_t start,
+                                  const std::vector<uint8_t> &data) {
+            auto reg = [&](uint16_t addr) -> int16_t {
+              size_t i = (size_t)(addr - start) * 2;
+              if (i + 1 >= data.size()) return 0;
+              return (int16_t) ((uint16_t(data[i]) << 8) | uint16_t(data[i + 1]));
+            };
+
+            if (start == 0) {
+              id(comp_demand).publish_state(reg(39));
+              id(comp_setpoint).publish_state(reg(40));
+              id(cmd_bits_0).publish_state(reg(0));
+              id(cmd_bits_1).publish_state(reg(1));
+              id(cmd_bits_25).publish_state(reg(25));
+              id(cmd_bits_26).publish_state(reg(26));
+            }
+
+            // Compact map of everything non-zero. Values are signed: regs 33
+            // and 34 are unpopulated sensor inputs and read -1, the same
+            // convention as reg 81's -58 for the absent tank sensor.
+            std::string map;
+            char buf[24];
+            for (size_t i = 0; i + 1 < data.size(); i += 2) {
+              int16_t v = (int16_t) ((uint16_t(data[i]) << 8) | uint16_t(data[i + 1]));
+              if (v == 0) continue;
+              snprintf(buf, sizeof(buf), "%u=%d ", (unsigned) (start + i / 2), (int) v);
+              // Home Assistant truncates states past 255 chars; leave headroom.
+              if (map.size() + strlen(buf) > 230) { map += "+more"; break; }
+              map += buf;
+            }
+            if (start == 0) {
+              id(raw_register_map).publish_state(map.empty() ? std::string("(all zero)") : map);
+            } else if (!map.empty()) {
+              ESP_LOGI("pool", "regs %u+: %s", (unsigned) start, map.c_str());
+            }
+          };
+
+          id(heatpump)->queue_command(
+              esphome::modbus_controller::ModbusCommandItem::create_read_command(
+                  id(heatpump), esphome::modbus_controller::ModbusRegisterType::HOLDING,
+                  0, 60, publish_block));
+
+          // 786-800 is static (only 786, constant 26). Once a minute is plenty.
+          if (++slow >= 12) {
+            slow = 0;
+            id(heatpump)->queue_command(
+                esphome::modbus_controller::ModbusCommandItem::create_read_command(
+                    id(heatpump), esphome::modbus_controller::ModbusRegisterType::HOLDING,
+                    786, 15, publish_block));
+          }
+
 button:
   - platform: restart
-    name: "${friendly_name} Restart"
+    name: "Restart"   # esphome: friendly_name is prepended automatically
 
 # ====================================================================
 # Sensors
@@ -702,56 +864,79 @@ sensor:
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Compressor Frequency"
+    id: reg_comp_freq
     address: 64
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:sine-wave
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Fan Frequency"
+    id: reg_fan_freq
     address: 65
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:fan
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater EEV Opening"
+    id: reg_eev
     address: 66
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "steps"
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:valve
 
+  # Reg 72: DC bus voltage, NOT an energy counter. Idle ~336 (= sqrt(2) x Vac,
+  # PFC idle), running 377-380 regulated. Reads out the P7/P8/P9/P38 bus
+  # faults directly. Evidence in docs/PROTOCOL.md.
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Energy Total"
+    name: "Pool Heater DC Bus Voltage"
     address: 72
     register_type: holding
     value_type: U_WORD
-    unit_of_measurement: "kWh"
-    accuracy_decimals: 2
-    filters:
-      - multiply: 0.01
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:current-dc
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Ambient Temp"
+    id: reg_ambient
     address: 74
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Coiler Temp"
+    id: reg_coiler
     address: 75
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -760,38 +945,57 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Suction Temp"
+    id: reg_suction
     address: 77
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Discharge Temp"
+    id: reg_discharge
     address: 78
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Outlet Water Temp"
+    id: reg_outlet_water
     address: 80
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Inlet Water Temp"
+    id: reg_inlet_water
     address: 84
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   # ------------------------------------------------------------------
   # Gap fillers for the 64-84 block. With these present the block is
@@ -800,36 +1004,53 @@ sensor:
   # REDUCES bus load while adding sensors.
   # ------------------------------------------------------------------
 
-  # Reg 68: AC input voltage. Stable 239-244V, sags ~3V when compressor
-  # stops (line drop under load) - consistent with 240V residential supply.
+  # Reg 68: AC line voltage (RMS). No load-dependent rise - an earlier note
+  # claiming this was post-PFC was wrong; the PFC bus is reg 72.
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater AC Voltage"
+    id: reg_ac_voltage
     address: 68
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:sine-wave
     # Early warning for brownouts / P8-P10 / P26 voltage faults
 
-  # Reg 69: compressor load metric, scales ~1.5-1.7x compressor Hz.
-  # Hypothesis: input current in 0.1A units (unconfirmed - raw value kept)
+  # Reg 69: AC input current, 0.1 A per count. NOTE the measured scale is
+  # 0.095 A/count against a reference meter - a systematic ~5% disagreement,
+  # unresolved. Calibrate if you need absolute current. docs/PROTOCOL.md.
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Compressor Load"
+    name: "Pool Heater Input Current"
+    id: reg_input_current
     address: 69
     register_type: holding
     value_type: U_WORD
-    icon: mdi:gauge
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+    icon: mdi:current-ac
 
-  # Reg 71: varies with compressor load. Hypothesis: refrigerant temp
-  # at an intermediate circuit point (unconfirmed - raw value kept)
+  # Reg 71: high-side saturated (condensing) temperature, degF.
+  # Medium-high confidence, not cross-checked against a gauge set.
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Refrigerant Metric"
+    name: "Pool Heater Condensing Temp"
+    id: reg_condensing
     address: 71
     register_type: holding
     value_type: U_WORD
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:thermometer-lines
 
   # Reg 81: water tank sensor. Reads -58 = not installed on this model
@@ -895,9 +1116,11 @@ sensor:
     address: 70
     register_type: holding
     value_type: U_WORD
+    state_class: measurement
     icon: mdi:waves-arrow-right
-    # Scales with compressor load (~= compressor Hz)
-    # Non-zero = unit is actively transferring heat
+    # Non-zero = actively transferring heat; the boolean derivative is
+    # correct. The SCALAR IS NOT DECODED - not a power proxy (r2=0.59).
+    # Do not scale it. docs/PROTOCOL.md.
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -906,6 +1129,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:thermometer-water
     # Mirrors inlet water temp — smoothed value used by display
 
@@ -916,6 +1142,7 @@ sensor:
     register_type: holding
     value_type: U_WORD
     force_new_range: true
+    entity_category: diagnostic
     icon: mdi:state-machine
     # 0x1C (28) = post-shutdown equalization
 
@@ -929,17 +1156,21 @@ sensor:
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Protection Bit 96"
+    id: reg_prot_96
     address: 96
     register_type: holding
     value_type: U_WORD
+    entity_category: diagnostic
     icon: mdi:shield-check
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Protection Bit 97"
+    id: reg_prot_97
     address: 97
     register_type: holding
     value_type: U_WORD
+    entity_category: diagnostic
     icon: mdi:shield-check
 
   - platform: modbus_controller
@@ -954,27 +1185,30 @@ sensor:
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Protection Bit 99"
+    id: reg_prot_99
     address: 99
     register_type: holding
     value_type: U_WORD
+    entity_category: diagnostic
     icon: mdi:shield-check
 
   # ------------------------------------------------------------------
   # Slow diagnostics (every 12th cycle = 60s at 5s base).
-  # Regs 272-275: 272 = running-hours candidate (998, watch long-term);
-  # 274/275 = 86/90, refrigerant pressure candidates (PSI?) - these are
-  # the registers to check during a future E05/E06 pressure fault.
+  # Regs 272-275 are STATIC (998/86/90). NOT a runtime counter, NOT
+  # pressures - the earlier labels were wrong. Kept cheaply in case they
+  # move during a pressure fault.
   # skip_updates on EVERY sensor in the range (range takes the minimum).
   # ------------------------------------------------------------------
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Runtime Counter"
+    name: "Pool Heater Static Reg 272"
     address: 272
     register_type: holding
     value_type: U_WORD
     force_new_range: true
     skip_updates: 12
-    icon: mdi:counter
+    entity_category: diagnostic
+    icon: mdi:help-circle-outline
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -987,23 +1221,162 @@ sensor:
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Pressure A"
+    name: "Pool Heater Static Reg 274"
     address: 274
     register_type: holding
     value_type: U_WORD
     skip_updates: 12
-    icon: mdi:gauge-low
-    # Hypothesis: low-side refrigerant pressure (PSI)
+    entity_category: diagnostic
+    icon: mdi:help-circle-outline
+    # Constant 86 across all logging to date - not a pressure.
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Pressure B"
+    name: "Pool Heater Static Reg 275"
     address: 275
     register_type: holding
     value_type: U_WORD
     skip_updates: 12
-    icon: mdi:gauge
-    # Hypothesis: high-side refrigerant pressure (PSI)
+    entity_category: diagnostic
+    icon: mdi:help-circle-outline
+    # Constant 90 across all logging to date - not a pressure.
+
+  # ------------------------------------------------------------------
+  # Command block 0-59, pushed by the block read in the interval: section
+  # (update_interval: never = "only when something publishes to me").
+  # 0-59 fits in ONE Modbus frame. Full decode in docs/PROTOCOL.md.
+  # ------------------------------------------------------------------
+
+  # The control law's output - what the controller WANTS. Explains why the
+  # unit sits at a given speed; visible here and nowhere else.
+  - platform: template
+    name: "Pool Heater Compressor Demand"
+    id: comp_demand
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    icon: mdi:target
+
+  # What is fed to the inverter. Rate-limited to 5 Hz per 5 s on
+  # deceleration. Compare against Compressor Frequency (reg 64, actual).
+  - platform: template
+    name: "Pool Heater Compressor Setpoint"
+    id: comp_setpoint
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    icon: mdi:ray-start-arrow
+
+  # Command bitfields - every bit LEADS its physical event.
+  #   reg 0  bit 12 = run demand      reg 1  bit 5 = run demand
+  #   reg 25 bit 6 = run demand, bit 1 = fan
+  #   reg 26 bit 5 = fan, bit 0 = compressor
+  # Remaining bits unmapped only because this unit has not faulted.
+  - platform: template
+    name: "Pool Heater Command Bits 0"
+    id: cmd_bits_0
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
+
+  - platform: template
+    name: "Pool Heater Command Bits 1"
+    id: cmd_bits_1
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
+
+  - platform: template
+    name: "Pool Heater Command Bits 25"
+    id: cmd_bits_25
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
+
+  - platform: template
+    name: "Pool Heater Command Bits 26"
+    id: cmd_bits_26
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
+
+  # ------------------------------------------------------------------
+  # Derived refrigeration diagnostics. All three come from registers that
+  # are already being read, so they cost no additional Modbus frames.
+  # ------------------------------------------------------------------
+
+  # Evaporator superheat (outdoor coil is the evaporator in heat mode).
+  # Runs 2-3 F and steady; sustained drift means charge or EEV.
+  - platform: template
+    name: "Pool Heater Evaporator Superheat"
+    id: evap_superheat
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    icon: mdi:thermometer-low
+    lambda: |-
+      if (!id(reg_suction).has_state() || !id(reg_coiler).has_state()) return {};
+      if (id(reg_comp_freq).state < 1) return {};
+      return id(reg_suction).state - id(reg_coiler).state;
+
+  # Discharge superheat. A rising trend at matched conditions is the
+  # classic undercharge signature.
+  - platform: template
+    name: "Pool Heater Discharge Superheat"
+    id: discharge_superheat
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    icon: mdi:thermometer-high
+    lambda: |-
+      if (!id(reg_discharge).has_state() || !id(reg_condensing).has_state()) return {};
+      if (id(reg_comp_freq).state < 1) return {};
+      return id(reg_discharge).state - id(reg_condensing).state;
+
+  # Heat exchanger approach. WATCH THIS: it varied 13-25 F between runs at
+  # identical speed and power. If it climbs at MATCHED conditions that means
+  # fouling or reduced flow - and that the reg 71 decode needs revisiting.
+  - platform: template
+    name: "Pool Heater Condenser Approach"
+    id: condenser_approach
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    icon: mdi:heat-wave
+    lambda: |-
+      if (!id(reg_condensing).has_state() || !id(reg_outlet_water).has_state()) return {};
+      if (id(reg_comp_freq).state < 1) return {};
+      return id(reg_condensing).state - id(reg_outlet_water).state;
+
+  # ------------------------------------------------------------------
+  # Derived: input apparent power = line voltage x input current.
+  # Exact by definition (VA = V x I) given reg 68 and reg 69; matched a
+  # Shelly EM Gen3 at r2 = 0.9702 over a full run. Real power is lower by
+  # the power factor (~0.98 at load, ~0.61 during the startup ramp).
+  # ------------------------------------------------------------------
+  - platform: template
+    name: "Pool Heater Input Apparent Power"
+    id: input_apparent_power
+    unit_of_measurement: "VA"
+    device_class: apparent_power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    icon: mdi:flash
+    lambda: |-
+      if (!id(reg_ac_voltage).has_state() || !id(reg_input_current).has_state())
+        return {};
+      return id(reg_ac_voltage).state * id(reg_input_current).state;
 
 # ====================================================================
 switch:
