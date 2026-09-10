@@ -236,8 +236,18 @@ no Modbus exceptions — so these are real, implemented registers.
 Of the 60 registers in 0-59, twelve are live: 0, 1, 25, 26, 29, 30, 33, 34,
 36, 39, 40. In 786-800, only 786 (constant 26). Everything else reads zero.
 
+Since v1.4.0 the **production config captures 0-59 every cycle** as a single
+frame, so the overlay is no longer needed for these ranges. Decoded registers
+go to named sensors; every other non-zero value lands in the `Raw Register
+Map` text sensor, which Home Assistant records only when it changes. Two
+further sensors, `Last Defrost` and `Last Fault Snapshot`, latch the full map
+plus surrounding conditions at the instant those events begin — a defrost
+lasts minutes and then everything returns to normal, so the snapshot is what
+makes the event legible afterwards.
+
 Still never read: 165-255, 296-375, 558-767, 801-2047. No particular reason to
-expect content there.
+expect content there. `tools/register-survey.yaml` remains the tool for
+sweeping them — edit `SURVEY_RANGES`.
 
 **Coverage was never the bottleneck.** A register that does not change teaches
 nothing, and this unit is healthy: 96/97/99 have read 1 continuously,
@@ -346,7 +356,21 @@ To find it, watch the diagnostic register dumps during a defrost event. Defrost 
 - Brief reversal of inlet/outlet water delta T
 - The Tuya app showing "Defrosting"
 
-If you capture a defrost event with this integration and identify which register changes, please contribute the finding back — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+**Since v1.4.0 this is instrumented.** The `Defrosting` binary sensor infers
+the cycle from the physical signature — compressor turning while the outdoor
+fan is stopped, heat mode only — without needing a register at all. In every
+run logged, the fan has never been at zero while the compressor turns, so the
+combination is unambiguous. When it fires, `Last Defrost` latches the
+compressor, fan, coil, ambient, suction, discharge and condensing
+temperatures, the EEV position, **and the full 0-59 register map**, and logs
+the lot at WARN.
+
+So the real defrost flag, if one exists, will identify itself the first time
+the unit defrosts: compare the latched register map against the healthy
+baseline documented in the command block above. In a warm climate that means
+waiting for winter — the outdoor coil has to be below freezing.
+
+If you capture a defrost event and identify which register changes, please contribute the finding back — see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## OEM fault code reference
 
@@ -507,11 +531,30 @@ commands are never sent, so the retry counter never moves).
 ### Frame count guidance
 
 Bus time is dominated by per-frame throttle slots, not data bytes. A
-21-register read costs one `command_throttle` slot — the same as a
-1-register read. When adding sensors, pad gaps with `internal: true`
-sensors so contiguous blocks read as single frames. The v1.2.0 config
-reads regs 29, 64-84, 96-99, 768-779, and 785 in five frames per
-cycle (plus 272-275 every 12th cycle).
+A 21-register read costs one `command_throttle` slot — the same as a
+1-register read. Modbus allows up to **125 registers per read**, so a wide
+contiguous block is nearly free while a scattered handful is not. When adding
+sensors, pad gaps with `internal: true` sensors so contiguous blocks read as
+single frames.
+
+The v1.4.0 config reads, per 5s cycle:
+
+| Frame | Registers |
+|---|---|
+| 1 | 0-59 (the whole command block, one frame) |
+| 2 | 64-84 |
+| 3 | 96-99 |
+| 4 | 768-779 |
+| 5 | 785 |
+| 6 | 29 |
+
+plus 272-275 and 786-800 every 12th cycle. Six frames at 100ms throttle is
+600ms of a 5000ms cycle.
+
+Capturing all sixty registers of the command block therefore costs about what
+a single register costs. That is the whole reason the v1.4.0 event capture is
+affordable: there is no cheaper way to be watching when a fault or a defrost
+finally happens than to read the entire block every cycle.
 
 ## Validation methodology
 
