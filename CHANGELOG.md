@@ -1,5 +1,64 @@
 # Changelog
 
+## v1.3.0 — Register decode corrections
+
+Three registers were carrying wrong labels. All corrections below were
+established by regression against an external power meter on the heat pump
+feed and against whole-pool energy balance, over two full run cycles
+(1499 sampled points), then reproduced on a third.
+
+### Corrected registers
+
+| Reg | Was | Is | Evidence |
+|---|---|---|---|
+| 72 | `Energy Total` (kWh, ×0.01) | **DC bus voltage** (V) | Idle 336 = √2 × 237Vac; running 377–380 regulated; precharge dip to 327 on start; back to 336 within 5s of stop. Never accumulates. |
+| 69 | `Compressor Load` (raw) | **AC input current** (×0.1 A) | `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702 — beats the pure-power fit, the signature of a current. |
+| 71 | `Refrigerant Metric` (raw) | **Condensing temp** (°F) | Idle equalises between water and ambient; running mean 101; collapses 104→78 within 2 min of shutdown. |
+
+**If you were feeding reg 72 into the HA energy dashboard, remove it.** It
+was never energy — the values are bus volts, and they do not accumulate.
+
+### Corrected labels (no functional change)
+
+- Regs 272 / 274 / 275 were labelled `Runtime Counter` / `Pressure A` /
+  `Pressure B`. All three are **static constants** (998 / 86 / 90),
+  unchanged across 5 days of logging including a full 8.5h run. Renamed to
+  `Static Reg N` and marked diagnostic. Still polled once a minute in case
+  they move during an E05/E06 pressure fault.
+- Reg 70 keeps the name `Active Heating` — the boolean derivative is
+  correct — but the scalar is explicitly **not decoded**. It is not a power
+  proxy (r²=0.59 against measured input power). Do not scale it.
+- `docs/PROTOCOL.md` claimed reg 68 was post-PFC and rose under load. It
+  does not: idle mean 236.9V, running mean 237.3V. It is plain RMS line
+  voltage. The PFC bus is reg 72.
+
+### New
+
+- **Input Apparent Power** (VA), derived as reg 68 × reg 69. Exact by
+  definition; matched the reference meter at r²=0.9702.
+
+### Home Assistant metadata
+
+Every sensor now declares `device_class` / `state_class` / `accuracy_decimals`
+where applicable (15 / 17 / 16 respectively). Previously none did, which
+meant **no long-term statistics for any sensor** — no history graphs beyond
+the recorder window, no unit conversion, no energy dashboard eligibility.
+Protection bits, running state and the static registers are now
+`entity_category: diagnostic`.
+
+### Fixed
+
+- The restart button was named `"${friendly_name} Restart"` with no
+  `substitutions:` block, so the literal `${friendly_name}` reached Home
+  Assistant. Now `"Restart"`, which ESPHome prefixes automatically.
+
+### Upgrading
+
+Renaming a sensor changes its entity ID and orphans the old entity. Affected:
+`energy_total`, `compressor_load`, `refrigerant_metric`, `runtime_counter`,
+`pressure_a`, `pressure_b`, and the restart button. Update any dashboard
+cards, automations or templates that reference them before flashing.
+
 ## v1.2.0 — Bus resilience under EMI / ESPHome 2026.3.0+ compatibility
 
 ### Critical fix: TX starvation on ESPHome 2026.3.0+

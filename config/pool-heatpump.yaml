@@ -23,7 +23,7 @@ esphome:
   friendly_name: Pool Heat Pump
   project:
     name: esphome.pool_heatpump
-    version: "1.2.0"
+    version: "1.3.0"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -563,7 +563,7 @@ interval:
 
 button:
   - platform: restart
-    name: "${friendly_name} Restart"
+    name: "Restart"   # esphome: friendly_name is prepended automatically
 
 # ====================================================================
 # Sensors
@@ -706,6 +706,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:sine-wave
 
   - platform: modbus_controller
@@ -715,6 +718,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:fan
 
   - platform: modbus_controller
@@ -724,18 +730,27 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "steps"
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:valve
 
+  # Reg 72: DC bus voltage (inverter link), NOT an energy counter.
+  # Confirmed 2026-09: idle 336V = sqrt(2) x 237Vac (passive rectified peak,
+  # PFC idle); running 377-380V tightly regulated (PFC boost active); on
+  # start dips to 327 (precharge inrush) then 357 -> 378 within 5s; on stop
+  # returns to ~336 within 5s. Never accumulates. Direct readout for the
+  # P7 / P8 / P9 / P38 bus-voltage faults.
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Energy Total"
+    name: "Pool Heater DC Bus Voltage"
     address: 72
     register_type: holding
     value_type: U_WORD
-    unit_of_measurement: "kWh"
-    accuracy_decimals: 2
-    filters:
-      - multiply: 0.01
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: mdi:current-dc
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -744,6 +759,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -752,6 +770,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -760,6 +781,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -768,6 +792,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -776,6 +803,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -784,6 +814,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -792,6 +825,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
 
   # ------------------------------------------------------------------
   # Gap fillers for the 64-84 block. With these present the block is
@@ -800,36 +836,64 @@ sensor:
   # REDUCES bus load while adding sensors.
   # ------------------------------------------------------------------
 
-  # Reg 68: AC input voltage. Stable 239-244V, sags ~3V when compressor
-  # stops (line drop under load) - consistent with 240V residential supply.
+  # Reg 68: AC line voltage (RMS). Measured 2026-09 over a full 8.5h run:
+  # idle mean 236.94 V, running mean 237.28 V - no load-dependent rise.
+  # (An earlier note claimed this was post-PFC and rose under load; it is
+  # not. The PFC bus is reg 72.)
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater AC Voltage"
+    id: reg_ac_voltage
     address: 68
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:sine-wave
     # Early warning for brownouts / P8-P10 / P26 voltage faults
 
-  # Reg 69: compressor load metric, scales ~1.5-1.7x compressor Hz.
-  # Hypothesis: input current in 0.1A units (unconfirmed - raw value kept)
+  # Reg 69: AC input current, 0.1 A per count.
+  # Confirmed 2026-09 against a Shelly EM Gen3 on the heat pump feed,
+  # 1499 samples over a full run:
+  #   VA = 0.09501 x (reg69 x reg68)   r2 = 0.9702
+  #   W  = 22.09   x  reg69           r2 = 0.9594
+  # Including line voltage in the model beats the pure-power fit, which is
+  # the signature of a current rather than a power. Measured scale came out
+  # 0.095 A/count vs the nominal 0.1 - i.e. this register and the Shelly
+  # disagree by ~5%; which one is off is unresolved. See docs/PROTOCOL.md.
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Compressor Load"
+    name: "Pool Heater Input Current"
+    id: reg_input_current
     address: 69
     register_type: holding
     value_type: U_WORD
-    icon: mdi:gauge
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+    icon: mdi:current-ac
 
-  # Reg 71: varies with compressor load. Hypothesis: refrigerant temp
-  # at an intermediate circuit point (unconfirmed - raw value kept)
+  # Reg 71: high-side saturated (condensing) temperature, degF.
+  # Evidence 2026-09: idle 78.7 (equalised between 88F water and 74F
+  # ambient); running 101 mean, tracking outlet water +10..15F approach;
+  # collapses 104 -> 78 within 2 min of shutdown, i.e. refrigerant
+  # equalisation, not thermal mass. Medium-high confidence, not yet
+  # cross-checked against a gauge set.
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Refrigerant Metric"
+    name: "Pool Heater Condensing Temp"
     address: 71
     register_type: holding
     value_type: U_WORD
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:thermometer-lines
 
   # Reg 81: water tank sensor. Reads -58 = not installed on this model
@@ -895,9 +959,17 @@ sensor:
     address: 70
     register_type: holding
     value_type: U_WORD
+    state_class: measurement
     icon: mdi:waves-arrow-right
-    # Scales with compressor load (~= compressor Hz)
-    # Non-zero = unit is actively transferring heat
+    # Non-zero = unit is actively transferring heat. Name kept because the
+    # boolean derivative (binary_sensor "Heating Active") is correct.
+    # The scalar is NOT decoded: 2026-09 regression gives r2=0.59 against
+    # measured input power, so it is not a power proxy. It is hard-gated to
+    # 0 with the compressor and ramps 26 -> 60 in 30s at start. Within any
+    # 1h window it tracks reg 69 at r2 0.6-0.94, but the slope wanders
+    # 0.12-0.44 and the mean drifts up with condensing temperature - the
+    # behaviour of compressor motor current under rising lift.
+    # To settle it: clamp meter on one compressor lead during a run.
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -906,6 +978,9 @@ sensor:
     register_type: holding
     value_type: U_WORD
     unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
     icon: mdi:thermometer-water
     # Mirrors inlet water temp — smoothed value used by display
 
@@ -916,6 +991,7 @@ sensor:
     register_type: holding
     value_type: U_WORD
     force_new_range: true
+    entity_category: diagnostic
     icon: mdi:state-machine
     # 0x1C (28) = post-shutdown equalization
 
@@ -932,6 +1008,7 @@ sensor:
     address: 96
     register_type: holding
     value_type: U_WORD
+    entity_category: diagnostic
     icon: mdi:shield-check
 
   - platform: modbus_controller
@@ -940,6 +1017,7 @@ sensor:
     address: 97
     register_type: holding
     value_type: U_WORD
+    entity_category: diagnostic
     icon: mdi:shield-check
 
   - platform: modbus_controller
@@ -957,24 +1035,29 @@ sensor:
     address: 99
     register_type: holding
     value_type: U_WORD
+    entity_category: diagnostic
     icon: mdi:shield-check
 
   # ------------------------------------------------------------------
   # Slow diagnostics (every 12th cycle = 60s at 5s base).
-  # Regs 272-275: 272 = running-hours candidate (998, watch long-term);
-  # 274/275 = 86/90, refrigerant pressure candidates (PSI?) - these are
-  # the registers to check during a future E05/E06 pressure fault.
+  # Regs 272-275 are STATIC on this firmware: 272=998, 274=86, 275=90,
+  # unchanged across 5 days of logging including a full 8.5h run
+  # (2026-09). They are NOT a runtime counter and NOT pressures - the
+  # earlier labels were wrong. Kept, cheaply, on the chance they move
+  # during an E05/E06 pressure fault; marked diagnostic so they stay out
+  # of the way until then.
   # skip_updates on EVERY sensor in the range (range takes the minimum).
   # ------------------------------------------------------------------
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Runtime Counter"
+    name: "Pool Heater Static Reg 272"
     address: 272
     register_type: holding
     value_type: U_WORD
     force_new_range: true
     skip_updates: 12
-    icon: mdi:counter
+    entity_category: diagnostic
+    icon: mdi:help-circle-outline
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
@@ -987,23 +1070,45 @@ sensor:
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Pressure A"
+    name: "Pool Heater Static Reg 274"
     address: 274
     register_type: holding
     value_type: U_WORD
     skip_updates: 12
-    icon: mdi:gauge-low
-    # Hypothesis: low-side refrigerant pressure (PSI)
+    entity_category: diagnostic
+    icon: mdi:help-circle-outline
+    # Constant 86 across all logging to date - not a pressure.
 
   - platform: modbus_controller
     modbus_controller_id: heatpump
-    name: "Pool Heater Pressure B"
+    name: "Pool Heater Static Reg 275"
     address: 275
     register_type: holding
     value_type: U_WORD
     skip_updates: 12
-    icon: mdi:gauge
-    # Hypothesis: high-side refrigerant pressure (PSI)
+    entity_category: diagnostic
+    icon: mdi:help-circle-outline
+    # Constant 90 across all logging to date - not a pressure.
+
+  # ------------------------------------------------------------------
+  # Derived: input apparent power = line voltage x input current.
+  # Exact by definition (VA = V x I) given reg 68 and reg 69; matched a
+  # Shelly EM Gen3 at r2 = 0.9702 over a full run. Real power is lower by
+  # the power factor (~0.98 at load, ~0.61 during the startup ramp).
+  # ------------------------------------------------------------------
+  - platform: template
+    name: "Pool Heater Input Apparent Power"
+    id: input_apparent_power
+    unit_of_measurement: "VA"
+    device_class: apparent_power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    icon: mdi:flash
+    lambda: |-
+      if (!id(reg_ac_voltage).has_state() || !id(reg_input_current).has_state())
+        return {};
+      return id(reg_ac_voltage).state * id(reg_input_current).state;
 
 # ====================================================================
 switch:

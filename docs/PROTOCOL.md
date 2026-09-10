@@ -50,11 +50,11 @@ The unit's temperature display mode can typically be changed in the settings men
 | 64 | Compressor frequency | Hz | |
 | 65 | Fan frequency | Hz | |
 | 66 | EEV opening | steps | |
-| 68 | AC voltage (post-PFC stage) | V | ~238V idle, ~243V compressor running. RISES under load — measured after the power-factor-correction boost stage, not raw line voltage. Useful brownout/P8-P10/P26 early warning. |
-| 69 | Compressor load metric | — | Scales ~1.5-1.7× compressor Hz (78 at 42Hz, 120 at 70Hz observed); hypothesis = input current ×0.1A |
-| 70 | Active heating indicator | — | Non-zero when compressor running and heat transferring; mirrors compressor load |
-| 71 | Refrigerant temp | — | Varies with compressor load; point in refrigerant circuit TBD |
-| 72 | Energy total | ×0.01 kWh | |
+| 68 | **AC line voltage** | V | RMS mains. Measured over two full runs: idle mean 236.9V, running mean 237.3V — **no load-dependent rise**. Useful brownout / P8-P10 / P26 early warning. (An earlier revision of this document claimed reg 68 was post-PFC and rose under load. That was wrong; the PFC bus is reg 72.) |
+| 69 | **AC input current** | ×0.1 A | Confirmed against an external power meter, 1499 samples: `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702, vs `W = 22.09 × reg69`, r²=0.9594. Including line voltage improves the fit — the signature of a current, not a power. Measured scale 0.095 A/count vs nominal 0.1; see caveat below. |
+| 70 | Activity index — **scale undecoded** | — | Hard-gated to 0 with the compressor; ramps 26→60 within 30s of start. **Not** a power proxy (r²=0.59 vs measured input power). Within a 1h window tracks reg 69 at r² 0.6–0.94, but the slope wanders 0.12–0.44 and the mean drifts upward with condensing temperature — consistent with compressor motor current under rising lift. Reliable as a boolean (non-zero = transferring heat); do not scale it. |
+| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. Medium-high confidence; not yet checked against a gauge set. |
+| 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
 | 74 | Ambient temp | °F | |
 | 75 | Coiler temp (outdoor evaporator) | °F | |
 | 76 | Incoiler temp (indoor heat exchanger) | °F | |
@@ -65,6 +65,29 @@ The unit's temperature display mode can typically be changed in the settings men
 | 81 | Water tank sensor | signed | -58 = sensor not installed (E14, cosmetic) |
 | 83 | State flag | — | Always 1 when powered; purpose unknown |
 | 84 | **Inlet water temp** | °F | Confirmed against OEM display |
+
+### Registers 272-275 — static constants
+
+| Register | Value | Status |
+|---|---|---|
+| 272 | 998 | **Static.** Previously labelled "runtime counter" — it is not. Unchanged across 5 days of logging including a full 8.5h run. |
+| 273 | 0 | Empty |
+| 274 | 86 | **Static.** Previously labelled "low-side pressure" — it is not. |
+| 275 | 90 | **Static.** Previously labelled "high-side pressure" — it is not. |
+
+These almost certainly hold model/config constants. They are still polled
+once a minute on the chance they move during an E05/E06 pressure fault,
+which is the only condition under which they have not yet been observed.
+
+### Caveat on the reg 69 current scale
+
+Regressed against an external clamp meter the scale comes out **0.095 A per
+count**, not the 0.1 that the register's granularity implies. That is a
+systematic ~5% disagreement between the controller's own current sensing
+and the reference meter, reproduced on two separate runs — it is not noise.
+Which of the two is off has not been established. If you need absolute
+current, calibrate against your own meter; if you need a relative load
+signal, the register is excellent (r² > 0.97).
 
 ### Protection status registers (96-99)
 
