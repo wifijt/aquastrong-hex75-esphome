@@ -23,7 +23,7 @@ esphome:
   friendly_name: Pool Heat Pump
   project:
     name: esphome.pool_heatpump
-    version: "1.3.0"
+    version: "1.4.0"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -287,6 +287,42 @@ text_sensor:
       snprintf(buf, sizeof(buf), "Fault 0x%04X (%d)", f, f);
       return std::string(buf);
 
+  # Latched snapshot of the conditions at the last defrost START. Home
+  # Assistant records the state change, but a defrost lasts a few minutes and
+  # then everything returns to normal - having the conditions frozen in one
+  # place means the event is legible months later without reconstructing it
+  # from history. This is the register we are hunting: if a defrost flag
+  # exists, it is in the register map captured here.
+  - platform: template
+    name: "Pool Heater Last Defrost"
+    id: last_defrost
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:snowflake-alert
+
+  # Same idea for a protection trip. Regs 96/97/99 have read 1 for the life of
+  # this integration; when one finally goes low this captures what else was
+  # true at that instant.
+  - platform: template
+    name: "Pool Heater Last Fault Snapshot"
+    id: last_fault_snapshot
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:alert-box
+
+  # Every non-zero register in 0-59 and 786-800, as one compact string.
+  # This is the defrost/fault net: 44 of the 60 registers in 0-59 read zero on
+  # a healthy unit, and any of them coming alive during a defrost cycle or an
+  # E-code shows up here with a recorder timestamp. One entity instead of
+  # sixty, and Home Assistant only writes a row when the string CHANGES -
+  # which is precisely when a register changed.
+  - platform: template
+    name: "Pool Heater Raw Register Map"
+    id: raw_register_map
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:map-search
+
   # Names whichever protection bit is low, so a fault that has never been
   # observed still identifies itself the first time it happens. 96/97/99
   # are undecoded - they have read 1 continuously for the life of this
@@ -304,7 +340,20 @@ text_sensor:
       if (id(reg_water_flow).state != 1) out += "98(flow) ";
       if (id(reg_prot_99).state != 1) out += "99 ";
       if (out.empty()) return std::string("All OK");
-      return std::string("Protection low: ") + out;
+      std::string msg = std::string("Protection low: ") + out;
+      // Latch the surrounding conditions the first time this trips, so the
+      // registers that identify the fault are not lost when it clears.
+      static bool latched = false;
+      if (!latched) {
+        latched = true;
+        char buf[255];
+        snprintf(buf, sizeof(buf), "%s | flow=%.0f comp=%.0fHz dis=%.0fF regs[%s]",
+                 msg.c_str(), id(reg_fault).state, id(reg_comp_freq).state,
+                 id(reg_discharge).state, id(raw_register_map).state.c_str());
+        id(last_fault_snapshot).publish_state(buf);
+        ESP_LOGE("pool", "PROTECTION TRIP: %s", buf);
+      }
+      return msg;
 
 # ====================================================================
 # Binary sensors
@@ -366,6 +415,25 @@ binary_sensor:
     filters:
       - delayed_on: 30s
       - delayed_off: 30s
+    on_press:
+      then:
+        - lambda: |-
+            char buf[255];
+            snprintf(buf, sizeof(buf),
+                     "START comp=%.0fHz fan=%.0fHz coil=%.0fF amb=%.0fF suc=%.0fF "
+                     "dis=%.0fF cond=%.0fF eev=%.0f regs[%s]",
+                     id(reg_comp_freq).state, id(reg_fan_freq).state,
+                     id(reg_coiler).state, id(reg_ambient).state,
+                     id(reg_suction).state, id(reg_discharge).state,
+                     id(reg_condensing).state, id(reg_eev).state,
+                     id(raw_register_map).state.c_str());
+            id(last_defrost).publish_state(buf);
+            ESP_LOGW("pool", "DEFROST DETECTED: %s", buf);
+    on_release:
+      then:
+        - lambda: |-
+            ESP_LOGW("pool", "DEFROST ENDED: coil=%.0fF regs[%s]",
+                     id(reg_coiler).state, id(raw_register_map).state.c_str());
 
   - platform: template
     name: "Pool Heater Heating Active"
@@ -603,6 +671,75 @@ interval:
     then:
       - script.execute: check_confirmations
 
+  # ------------------------------------------------------------------
+  # Command block capture (registers 0-59, plus 786-800 once a minute).
+  #
+  # One Modbus frame for the whole 0-59 block - the protocol allows 125
+  # registers per read, so sixty costs the same as one. Decoded registers are
+  # pushed to their named sensors; everything else lands in the Raw Register
+  # Map text sensor, which only changes when a register changes.
+  #
+  # This is what catches a defrost cycle or an E-code. Forty-four of these
+  # sixty registers read zero on a healthy unit. If one wakes up, Home
+  # Assistant records the exact moment.
+  # ------------------------------------------------------------------
+  - interval: 5s
+    then:
+      - lambda: |-
+          static uint8_t slow = 0;
+
+          auto publish_block = [](esphome::modbus_controller::ModbusRegisterType,
+                                  uint16_t start,
+                                  const std::vector<uint8_t> &data) {
+            auto reg = [&](uint16_t addr) -> int16_t {
+              size_t i = (size_t)(addr - start) * 2;
+              if (i + 1 >= data.size()) return 0;
+              return (int16_t) ((uint16_t(data[i]) << 8) | uint16_t(data[i + 1]));
+            };
+
+            if (start == 0) {
+              id(comp_demand).publish_state(reg(39));
+              id(comp_setpoint).publish_state(reg(40));
+              id(cmd_bits_0).publish_state(reg(0));
+              id(cmd_bits_1).publish_state(reg(1));
+              id(cmd_bits_25).publish_state(reg(25));
+              id(cmd_bits_26).publish_state(reg(26));
+            }
+
+            // Compact map of everything non-zero. Values are signed: regs 33
+            // and 34 are unpopulated sensor inputs and read -1, the same
+            // convention as reg 81's -58 for the absent tank sensor.
+            std::string map;
+            char buf[24];
+            for (size_t i = 0; i + 1 < data.size(); i += 2) {
+              int16_t v = (int16_t) ((uint16_t(data[i]) << 8) | uint16_t(data[i + 1]));
+              if (v == 0) continue;
+              snprintf(buf, sizeof(buf), "%u=%d ", (unsigned) (start + i / 2), (int) v);
+              // Home Assistant truncates states past 255 chars; leave headroom.
+              if (map.size() + strlen(buf) > 230) { map += "+more"; break; }
+              map += buf;
+            }
+            if (start == 0) {
+              id(raw_register_map).publish_state(map.empty() ? std::string("(all zero)") : map);
+            } else if (!map.empty()) {
+              ESP_LOGI("pool", "regs %u+: %s", (unsigned) start, map.c_str());
+            }
+          };
+
+          id(heatpump)->queue_command(
+              esphome::modbus_controller::ModbusCommandItem::create_read_command(
+                  id(heatpump), esphome::modbus_controller::ModbusRegisterType::HOLDING,
+                  0, 60, publish_block));
+
+          // 786-800 is static (only 786, constant 26). Once a minute is plenty.
+          if (++slow >= 12) {
+            slow = 0;
+            id(heatpump)->queue_command(
+                esphome::modbus_controller::ModbusCommandItem::create_read_command(
+                    id(heatpump), esphome::modbus_controller::ModbusRegisterType::HOLDING,
+                    786, 15, publish_block));
+          }
+
 button:
   - platform: restart
     name: "Restart"   # esphome: friendly_name is prepended automatically
@@ -770,6 +907,7 @@ sensor:
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater EEV Opening"
+    id: reg_eev
     address: 66
     register_type: holding
     value_type: U_WORD
@@ -799,6 +937,7 @@ sensor:
   - platform: modbus_controller
     modbus_controller_id: heatpump
     name: "Pool Heater Ambient Temp"
+    id: reg_ambient
     address: 74
     register_type: holding
     value_type: U_WORD
@@ -1142,6 +1281,77 @@ sensor:
     entity_category: diagnostic
     icon: mdi:help-circle-outline
     # Constant 90 across all logging to date - not a pressure.
+
+  # ------------------------------------------------------------------
+  # Command block 0-59, decoded 2026-09-10. These are pushed by the block
+  # read in the interval: section - update_interval: never means "only when
+  # something publishes to me". Registers 0-59 fit in ONE Modbus frame (the
+  # protocol limit is 125), so capturing the whole block costs about what the
+  # single reg 29 read already costs.
+  # ------------------------------------------------------------------
+
+  # The control law's output: what the controller WANTS the compressor to do.
+  # This is the register that explains behaviour - why the unit is at 52Hz
+  # rather than 78Hz is visible here and nowhere else.
+  - platform: template
+    name: "Pool Heater Compressor Demand"
+    id: comp_demand
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    icon: mdi:target
+
+  # What is actually fed to the inverter. Rate-limited to 5 Hz per 5 s on
+  # deceleration; on acceleration it steps straight to demand and the drive's
+  # own ramp limits the actual instead. Compare against Compressor Frequency
+  # (reg 64, the measured actual) to see the drive tracking its setpoint.
+  - platform: template
+    name: "Pool Heater Compressor Setpoint"
+    id: comp_setpoint
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    icon: mdi:ray-start-arrow
+
+  # Command bitfields. Every bit LEADS the physical event it describes: the
+  # fan bit sets ~5s before the fan spins, the compressor bit ~0.3s before it
+  # turns. Known bits below; the rest are unmapped only because this unit has
+  # not faulted, which is exactly why they are worth recording.
+  #   reg 0  bit 12 (0x1000) = run demand
+  #   reg 1  bit  5 (0x0020) = run demand
+  #   reg 25 bit  6 (0x0040) = run demand, bit 1 (0x02) = fan commanded
+  #   reg 26 bit  5 (0x0020) = fan commanded, bit 0 (0x01) = compressor
+  - platform: template
+    name: "Pool Heater Command Bits 0"
+    id: cmd_bits_0
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
+
+  - platform: template
+    name: "Pool Heater Command Bits 1"
+    id: cmd_bits_1
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
+
+  - platform: template
+    name: "Pool Heater Command Bits 25"
+    id: cmd_bits_25
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
+
+  - platform: template
+    name: "Pool Heater Command Bits 26"
+    id: cmd_bits_26
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:numeric
 
   # ------------------------------------------------------------------
   # Derived refrigeration diagnostics. All three come from registers that

@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.4.0 — Command block in production, event capture
+
+Promotes the register 0-59 decode from the temporary survey overlay into the
+shipped config, and adds the machinery to catch a defrost cycle or an E-code
+the first time one happens.
+
+### The whole command block, for one Modbus frame
+
+Registers 0-59 are read as a single frame — the protocol allows 125 registers
+per read, so capturing all sixty costs about what the existing single reg 29
+read costs. 786-800 is polled once a minute (it is static).
+
+### New sensors
+
+| Sensor | Register | Notes |
+|---|---|---|
+| **Compressor Demand** (Hz) | 39 | The control law's output — what the controller *wants*. This is the register that explains behaviour: why the unit sits at 52 Hz instead of 78 is visible here and nowhere else. |
+| **Compressor Setpoint** (Hz) | 40 | What is fed to the inverter. Rate-limited to 5 Hz per 5 s on deceleration; steps straight to demand on acceleration. Compare against Compressor Frequency (reg 64, measured actual) to watch the drive track. |
+| **Command Bits 0 / 1 / 25 / 26** | 0, 1, 25, 26 | Command bitfields. Every bit *leads* its physical event — the fan bit sets ~5 s before the fan spins, the compressor bit ~0.3 s before it turns. Diagnostic. |
+
+### Event capture
+
+- **Raw Register Map** — every non-zero register in 0-59 as one compact
+  string. Forty-four of those sixty read zero on a healthy unit; if any wakes
+  up during a defrost or a fault, Home Assistant records the exact moment.
+  One entity instead of sixty, and the recorder only writes a row when the
+  string *changes* — which is precisely when a register changed.
+- **Last Defrost** — latches compressor/fan/coil/ambient/suction/discharge/
+  condensing/EEV plus the full register map at the moment defrost starts, and
+  logs it at WARN. A defrost lasts minutes and then everything returns to
+  normal; this keeps the event legible months later. **If a defrost flag
+  register exists, it will be in the map captured here.**
+- **Last Fault Snapshot** — the same for a protection trip, latched on first
+  occurrence so the identifying registers survive the fault clearing.
+
+### Why this shape
+
+Registers 0 and 1 hold single bits in otherwise-empty 16-bit words at the
+bottom of the address space — the shape of a fault bitmap. Bit 12 of reg 0 and
+bit 5 of reg 1 mean "run demand". The remaining 30 bits are unmapped only
+because this unit has not faulted. Recording the whole block continuously is
+the only way to map them without being present when something goes wrong.
+
 ## v1.3.0 — Register decode corrections
 
 Three registers were carrying wrong labels. All corrections below were

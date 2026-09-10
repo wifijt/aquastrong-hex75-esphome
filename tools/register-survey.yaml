@@ -62,7 +62,11 @@ logger:
 # in about 25 seconds, so a 30s sweep resolves it as one before and one after
 # sample and tells you nothing about sequence. Turn this back down to 30s for
 # long unattended captures where you only care about slow state.
-# 30s raw sweep, kept as the safety net: it covers the FULL ranges, so a
+# NOTE: registers 0-59 and 786-800 are now captured by the PRODUCTION config
+# as of v1.4.0 - you do not need this overlay for them. It remains useful for
+# sweeping the still-unexplored ranges (165-255, 296-375, 558-767, 801-2047):
+# edit SURVEY_RANGES below.
+# 30s raw sweep.
 # register that reads zero today but wakes up during a fault or a defrost is
 # still caught. The promoted sensors below cover the 11 already known live at
 # the 5s poll rate, with recorder history. Belt and braces.
