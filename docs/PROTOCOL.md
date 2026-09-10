@@ -89,6 +89,75 @@ Which of the two is off has not been established. If you need absolute
 current, calibrate against your own meter; if you need a relative load
 signal, the register is excellent (r² > 0.97).
 
+### Command and status block (registers 0-40)
+
+Decoded 2026-09-10 by commanding a shutdown and a restart while logging at 5s
+resolution. Every value here **leads** the physical event it describes — these
+are command words, not measurements of what the machine is doing.
+
+| Register | Purpose | Values |
+|---|---|---|
+| **0** | Run demand bitfield | `0x1000` (bit 12) set = unit commanded to run, `0` = commanded off. Set/cleared within 5s of the on/off write, ~140s before the compressor actually moves. |
+| **1** | Run demand bitfield | `0x20` (bit 5) set = commanded to run, `0` = off. Moves in lockstep with reg 0. |
+| **25** | Command bitfield | bit 6 `0x40` = run demand; bit 1 `0x02` = fan commanded. Idle `0`, dwell `0x40` (64), running `0x42` (66). |
+| **26** | Command bitfield | bit 5 `0x20` = fan commanded; bit 0 `0x01` = compressor commanded. Idle `0`, fan only `0x20` (32), running `0x21` (33). |
+| **30** | Static | 28 on this firmware. Did not move across a full stop/start cycle — despite the value, it is **not** a mirror of the 785 state echo. |
+| **33**, **34** | Unpopulated sensor inputs | Both read `-1` (`0xFFFF`) as S_WORD. Same convention as reg 81's -58 for the absent tank sensor. Read these as signed. |
+| **36** | Static | 1. |
+| **39** | **Compressor demand frequency** | Hz. The control law's output — what the controller *wants*. Steps directly to the new target. |
+| **40** | **Ramp-limited frequency setpoint** | Hz. What is actually fed to the inverter. Rate-limited to **5 Hz per 5 s on deceleration**; on acceleration it steps straight to the demand and the drive's own ramp limits the actual. |
+
+Reg 64 (compressor frequency) is the measured actual, which chases reg 40.
+The three together are the full inverter control chain: **39 demand → 40 ramp →
+64 actual**.
+
+#### Observed shutdown sequence
+
+`t=0` is the power-off write. Compressor was at 78 Hz.
+
+```
++5.1  reg 0   4096 -> 0      demand cleared immediately
++5.1  reg 1     32 -> 0
++5.3  reg 39    78 -> 35     demand drops straight to the 35 Hz minimum
++5.3  reg 40    78 -> 74     ramp begins
+      reg 40 then steps 74,69,64,59,54,49,44,39,35 at exactly 5.0s intervals
+      reg 64 follows from just above: 77,76,72,64,60,56,52,44,40,36
++50.2 reg 39/40 35 -> 0
++55.1 reg 26    33 -> 32     compressor command bit clears
++55.3 reg 64    36 -> 0      compressor stops, 0.2s later
++141  fan 0                  84s post-run fan purge, then reg 25/26 -> 0
+```
+
+#### Observed startup sequence
+
+`t=0` is the power-on write, after an 11.8 minute off period.
+
+```
++4.1   reg 0/1   -> 4096/32   demand set, 140s before anything moves
++4.2   reg 25    -> 64        bit 6 run demand
++108.8 reg 785 34 -> 35       enters startup dwell
++124.1 reg 25 64 -> 66        bit 1 fan commanded
++124.1 reg 26  0 -> 32        bit 5 fan commanded
++129.3 fan       -> 22        fan spins, 5.2s AFTER the command bits
++139.2 reg 39/40 -> 42        demand and setpoint together, no ramp on the way up
++144.1 reg 26 32 -> 33        bit 0 compressor commanded
++144.4 reg 64    -> 30        compressor starts, 0.3s AFTER the bit
++154.3 reg 72 328 -> 347      PFC engages
++159.3 reg 72 347 -> 378      running bus voltage
++174..184 reg 64 30->34->38->42  actual climbs to demand
+```
+
+The restart delay is enforced between the demand bits being set and the fan
+being commanded — roughly 120s here, within the 3-5 minute window the manual
+describes.
+
+**Why regs 0 and 1 matter most.** They are single bits set in otherwise-empty
+16-bit words at the very bottom of the address space. That is the shape of a
+status/fault bitmap, and it is the most promising place yet found for the
+undecoded E-codes and the defrost flag. Bit 12 of reg 0 and bit 5 of reg 1 are
+now known to mean "run demand"; the remaining 30 bits are unmapped because
+this unit has not faulted.
+
 ### Protection status registers (96-99)
 
 These four registers form a protection status block. Pattern: **1 = OK, 0 = fault/protection active**.
@@ -157,28 +226,27 @@ The following register ranges consistently return 0 on this firmware:
 
 Other firmware versions may use some of these ranges.
 
-### Never surveyed
+### Survey status
 
-Cross-referencing what is documented above against what has actually been
-swept, these ranges have **never been read at all**:
+Ranges 0-59 and 786-800 were swept on 2026-09-10 with
+`tools/register-survey.yaml`, across a commanded shutdown and restart. Results
+are in the command/status block above. The bus answered cleanly throughout —
+no Modbus exceptions — so these are real, implemented registers.
 
-| Range | Why it matters |
-|---|---|
-| **0-28**, **30-59** | Reg 29 (flow/fault status) sits alone in an otherwise unexamined neighbourhood. On these OEM boards the fault-code block is almost always contiguous with the status word — this is the highest-probability location for the undecoded E-codes. |
-| **786-800** | Immediately past the 785 state echo, at the top of the control block. Second-most-likely spot for mode/state flags. |
-| 165-255, 296-375, 558-767, 801-2047 | Unexplored, no particular reason to expect content. |
+Of the 60 registers in 0-59, twelve are live: 0, 1, 25, 26, 29, 30, 33, 34,
+36, 39, 40. In 786-800, only 786 (constant 26). Everything else reads zero.
 
-`tools/register-survey.yaml` sweeps the first two groups. It is a temporary
-overlay: it pulls the production config in as a package, so all normal
-entities and safety behaviour stay live while it runs.
+Still never read: 165-255, 296-375, 558-767, 801-2047. No particular reason to
+expect content there.
 
-**Coverage is not the bottleneck.** A register that never changes teaches you
-nothing, and this controller has been healthy: regs 96/97/99 have read 1
-continuously, 272/274/275 have never moved, and no E-code has fired. A
-perfect sweep of an idle, fault-free unit returns another page of constants.
-The survey is worth running across state *transitions* — compressor start,
-shutdown, and above all a fault or a defrost cycle. Defrost requires the
-outdoor coil below freezing, so in a warm climate that is a winter capture.
+**Coverage was never the bottleneck.** A register that does not change teaches
+nothing, and this unit is healthy: 96/97/99 have read 1 continuously,
+272/274/275 have never moved, no E-code has fired. The first sweep of an idle
+machine returned a page of constants and looked empty; the same registers gave
+up a complete inverter control chain the moment the unit was made to change
+state. Any future decoding depends on catching **transitions**, and above all
+a fault or a defrost cycle. Defrost needs the outdoor coil below freezing —
+in a warm climate, a winter capture.
 
 ## Write operations
 
@@ -256,7 +324,7 @@ The 0x0311 register (decimal 785) reflects current operational state:
 | 32 | 0x20 | Idle (powered on, compressor off, flow present) |
 | 33 | 0x21 | Running steady — heat mode (higher load) |
 | 34 | 0x22 | Transitional |
-| 35 | 0x23 | Cool mode related |
+| 35 | 0x23 | **Startup dwell (heat mode)** — observed throughout the restart delay and the initial low-load ramp on 2026-09-10. An earlier revision listed this as "cool mode related"; that was wrong. |
 
 **Note:** 0x1D is used across multiple states — protection mode, startup dwell, and normal running at low load. It is **not reliable as a fault indicator** on its own. Combine with reg 29 and compressor frequency for full state assessment.
 

@@ -56,6 +56,16 @@ logger:
     survey: INFO
     modbus_controller: WARN
 
+# 5s sweep. The production poll cycle is also 5s and uses five frames; three
+# more per cycle is 800ms of bus time out of 5000ms. Deliberately fast because
+# the transitions worth capturing are short - a compressor spin-down completes
+# in about 25 seconds, so a 30s sweep resolves it as one before and one after
+# sample and tells you nothing about sequence. Turn this back down to 30s for
+# long unattended captures where you only care about slow state.
+# 30s raw sweep, kept as the safety net: it covers the FULL ranges, so a
+# register that reads zero today but wakes up during a fault or a defrost is
+# still caught. The promoted sensors below cover the 11 already known live at
+# the 5s poll rate, with recorder history. Belt and braces.
 interval:
   - interval: 30s
     then:
@@ -121,3 +131,155 @@ interval:
                    id(reg_fault).has_state() ? id(reg_fault).state : -1.0f,
                    id(reg_inlet_water).has_state() ? id(reg_inlet_water).state : -1.0f,
                    id(reg_outlet_water).has_state() ? id(reg_outlet_water).state : -1.0f);
+
+# ============================================================================
+# The registers found live in the first capture, promoted to real sensors so
+# Home Assistant's recorder stores them. The log sweep alone lives only in the
+# log stream - it dies with whatever is tailing it. The recorder writes only on
+# CHANGE, so a register that sits constant costs essentially nothing, while the
+# ones that move during a transition are timestamped and queryable afterwards.
+# Signed (S_WORD) because 33/34 read 65535, which is -1: unpopulated sensor
+# inputs, the same convention as reg 81's -58 for the absent tank sensor.
+# Padding registers keep each group to a single Modbus frame.
+# These are TEMPORARY. They orphan when you reinstall pool-heatpump.yaml.
+# ============================================================================
+sensor:
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 0"
+    address: 0
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 1"
+    address: 1
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 25"
+    address: 25
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 26"
+    address: 26
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_27
+    address: 27
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_28
+    address: 28
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 30"
+    address: 30
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 33"
+    address: 33
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 34"
+    address: 34
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_35
+    address: 35
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 36"
+    address: 36
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_37
+    address: 37
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    id: survey_pad_38
+    address: 38
+    register_type: holding
+    value_type: S_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 39"
+    address: 39
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 40"
+    address: 40
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan
+
+  - platform: modbus_controller
+    modbus_controller_id: heatpump
+    name: "Survey Reg 786"
+    address: 786
+    register_type: holding
+    value_type: S_WORD
+    entity_category: diagnostic
+    icon: mdi:magnify-scan

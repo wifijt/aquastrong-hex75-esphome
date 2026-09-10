@@ -58,6 +58,33 @@ was never energy — the values are bus volts, and they do not accumulate.
 All of the above are derived from registers already polled — no additional
 Modbus frames.
 
+### Register survey results (docs only)
+
+Ranges 0-59 and 786-800 — never previously read — were swept across a
+commanded shutdown and restart. This decoded the inverter control chain:
+
+- **reg 39** = compressor demand frequency (the control law's output)
+- **reg 40** = ramp-limited setpoint, rate-limited to **5 Hz per 5 s on
+  deceleration**; steps directly to demand on acceleration
+- **reg 64** (already known) = measured actual, chasing reg 40
+- **regs 0, 1, 25, 26** = command bitfields. Every bit *leads* the physical
+  event: the fan command bit sets 5.2s before the fan spins, the compressor
+  bit 0.3s before the compressor turns.
+- **regs 33, 34** = unpopulated sensor inputs, reading -1 as S_WORD
+- **regs 30, 36, 786** = static constants
+
+Regs 0 and 1 are single bits in otherwise-empty 16-bit words at the bottom of
+the address space — the shape of a fault bitmap, and the most promising place
+yet found for the undecoded E-codes and the defrost flag. Bit 12 of reg 0 and
+bit 5 of reg 1 mean "run demand"; the other 30 bits are unmapped because this
+unit has not faulted.
+
+Also corrects the 785 state map: value 35 was listed as "cool mode related".
+It is the heat-mode startup dwell, observed throughout a restart delay.
+
+None of this changes the shipped config — see `tools/register-survey.yaml` to
+reproduce it.
+
 ### Home Assistant metadata
 
 Every sensor now declares `device_class` / `state_class` / `accuracy_decimals`
