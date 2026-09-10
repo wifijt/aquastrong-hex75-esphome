@@ -36,6 +36,27 @@ was never energy — the values are bus volts, and they do not accumulate.
 
 - **Input Apparent Power** (VA), derived as reg 68 × reg 69. Exact by
   definition; matched the reference meter at r²=0.9702.
+- **Evaporator Superheat** (°F) = suction − coiler. Measured 2–3 °F and
+  rock steady across every run logged; a sustained drift means charge or
+  expansion valve.
+- **Discharge Superheat** (°F) = discharge − condensing. Observed 85→68 °F
+  on one run, 62→56 °F on another. A rising trend at matched conditions is
+  the classic undercharge signature.
+- **Condenser Approach** (°F) = condensing − outlet water. Observed 13–18 °F
+  on one run and 24–25 °F on another at identical compressor speed and
+  input power. Probably explained by the higher ambient raising capacity —
+  but if it climbs at matched conditions it means fouling or reduced flow,
+  and the reg 71 decode needs revisiting.
+- **Defrosting** (binary). This controller has no known defrost register and
+  does not need one: defrost stops the outdoor fan while the compressor
+  keeps running, and in every run logged the fan has never been at zero
+  while the compressor turns. Heat mode only, 30s debounce both ways.
+- **Protection Status** (text). Names whichever of regs 96/97/98/99 is low.
+  96/97/99 have read 1 continuously for the life of this integration, so
+  this is the mechanism by which we will finally learn what they mean.
+
+All of the above are derived from registers already polled — no additional
+Modbus frames.
 
 ### Home Assistant metadata
 
