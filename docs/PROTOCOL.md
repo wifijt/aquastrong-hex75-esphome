@@ -157,6 +157,29 @@ The following register ranges consistently return 0 on this firmware:
 
 Other firmware versions may use some of these ranges.
 
+### Never surveyed
+
+Cross-referencing what is documented above against what has actually been
+swept, these ranges have **never been read at all**:
+
+| Range | Why it matters |
+|---|---|
+| **0-28**, **30-59** | Reg 29 (flow/fault status) sits alone in an otherwise unexamined neighbourhood. On these OEM boards the fault-code block is almost always contiguous with the status word — this is the highest-probability location for the undecoded E-codes. |
+| **786-800** | Immediately past the 785 state echo, at the top of the control block. Second-most-likely spot for mode/state flags. |
+| 165-255, 296-375, 558-767, 801-2047 | Unexplored, no particular reason to expect content. |
+
+`tools/register-survey.yaml` sweeps the first two groups. It is a temporary
+overlay: it pulls the production config in as a package, so all normal
+entities and safety behaviour stay live while it runs.
+
+**Coverage is not the bottleneck.** A register that never changes teaches you
+nothing, and this controller has been healthy: regs 96/97/99 have read 1
+continuously, 272/274/275 have never moved, and no E-code has fired. A
+perfect sweep of an idle, fault-free unit returns another page of constants.
+The survey is worth running across state *transitions* — compressor start,
+shutdown, and above all a fault or a defrost cycle. Defrost requires the
+outdoor coil below freezing, so in a warm climate that is a winter capture.
+
 ## Write operations
 
 ### Critical: the version flag
