@@ -52,7 +52,7 @@ The unit's temperature display mode can typically be changed in the settings men
 | 66 | EEV opening | steps | |
 | 68 | **AC line voltage** | V | RMS mains. Measured over two full runs: idle mean 236.9V, running mean 237.3V — **no load-dependent rise**. Useful brownout / P8-P10 / P26 early warning. (An earlier revision of this document claimed reg 68 was post-PFC and rose under load. That was wrong; the PFC bus is reg 72.) |
 | 69 | **AC input current** | ×0.1 A | Confirmed against an external power meter, 1499 samples: `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702, vs `W = 22.09 × reg69`, r²=0.9594. Including line voltage improves the fit — the signature of a current, not a power. Measured scale 0.095 A/count vs nominal 0.1; see caveat below. |
-| 70 | Activity index — **scale undecoded** | — | Hard-gated to 0 with the compressor; ramps 26→60 within 30s of start. **Not** a power proxy (r²=0.59 vs measured input power). Within a 1h window tracks reg 69 at r² 0.6–0.94, but the slope wanders 0.12–0.44 and the mean drifts upward with condensing temperature — consistent with compressor motor current under rising lift. Reliable as a boolean (non-zero = transferring heat); do not scale it. |
+| 70 | Compressor load index — **scale undecoded** | — | Hard-gated to 0 with the compressor. **Tracks compressor speed almost 1:1**: across a clean ramp on 2026-09-12, `reg70 = 1.072 x regHz + 12.3`, r2 = 0.968, with 42→78 Hz producing 60→96 counts. On top of that it drifts upward at *constant* speed as lift rises — 78 Hz held for eight hours on 2026-09-08 while reg 70 climbed 95→104 tracking condensing temperature, so the offset above speed runs ~13 early in a run and ~26 late. So `reg70 = f(speed) + g(lift)`, the signature of a load or torque index rather than a power measurement. Not a current in 0.1 A units: 96 implies 9.6 A against ~10.5 A of DC bus current at full speed, but at 42 Hz it predicts 3.8 A where the register says 6.0. Reliable as a boolean (non-zero = transferring heat). |
 | 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. Medium-high confidence; not yet checked against a gauge set. |
 | 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
 | 74 | Ambient temp | °F | |
@@ -357,21 +357,41 @@ Register 98 provides a simpler boolean view of the same sensor: **1 = flow prese
 
 Hypothesis: each additional E-code adds 0x100 to the baseline 0xFF (e.g. E05 high pressure may = 767, E06 low pressure = 1023). Unconfirmed until observed naturally.
 
-## State echo register (0x0311)
+## Register 785 (0x0311) — undecoded
 
-The 0x0311 register (decimal 785) reflects current operational state:
+Earlier revisions of this document mapped 785 to named operating states
+(28 = equalization, 30 = ramping up, 32 = idle, 33 = running steady, and so on).
+**That mapping is withdrawn.** It came from spotting values during a handful of
+transitions; 599 samples across three days do not support it.
 
-| Value | Hex | Conditions observed |
-|---|---|---|
-| 28 | 0x1C | Post-shutdown equalization (compressor off, EEV equalizing) |
-| 29 | 0x1D | Protection mode, startup dwell, or running at low-mid load |
-| 30 | 0x1E | Ramping up (compressor spinning up) |
-| 32 | 0x20 | Idle (powered on, compressor off, flow present) |
-| 33 | 0x21 | Running steady — heat mode (higher load) |
-| 34 | 0x22 | Transitional |
-| 35 | 0x23 | **Startup dwell (heat mode)** — observed throughout the restart delay and the initial low-load ramp on 2026-09-10. An earlier revision listed this as "cool mode related"; that was wrong. |
+What the data does show:
 
-**Note:** 0x1D is used across multiple states — protection mode, startup dwell, and normal running at low load. It is **not reliable as a fault indicator** on its own. Combine with reg 29 and compressor frequency for full state assessment.
+- **It dithers between adjacent integers independently of machine state.** On
+  2026-09-12 it alternated 30/31 across power-on, flow establishment, the
+  compressor ramp from 0 to 78 Hz, and twenty minutes of steady running, with
+  no change corresponding to any of them. That is a quantised measurement
+  sitting near a boundary, not an enumerated state.
+- Observed range **28-36**.
+- Higher values *are* enriched for running: 36 appeared only with the
+  compressor turning, while 29-31 are under-represented relative to the ~20%
+  of samples in which the machine was running. So it carries some load-related
+  information.
+- Best single correlate is ambient temperature (r2 = 0.70 over 2.5 days), but
+  the slope matches no unit conversion, and both drift with time of day - most
+  likely confounded rather than causal.
+- **Not a temperature.** Read as degC it misses every sensor we have by 7-19 degF
+  on average with 6-12 degF of scatter: inlet water +12.3, outlet +8.6, ambient
+  +18.7, incoiler +11.6, condensing +7.4.
+
+Do not build logic on this register. Compressor frequency (reg 64), the command
+bitfields (0, 1, 25, 26) and the demand/setpoint pair (39, 40) between them
+describe operating state unambiguously and are decoded.
+
+Both the original mapping and a later amendment to it (reclassifying 35 from
+"cool mode related" to "heat-mode startup dwell") were made from single
+observations. 35 in fact appears 65% of the time while running and 33% while
+stopped. Small samples of a machine that spends most of its life in one state
+produce confident-looking mappings that mean nothing.
 
 ## Defrost mode — not yet identified
 
