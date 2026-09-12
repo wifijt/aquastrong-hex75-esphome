@@ -97,12 +97,13 @@ are command words, not measurements of what the machine is doing.
 
 | Register | Purpose | Values |
 |---|---|---|
-| **0** | Run demand bitfield | `0x1000` (bit 12) set = unit commanded to run, `0` = commanded off. Set/cleared within 5s of the on/off write, ~140s before the compressor actually moves. |
-| **1** | Run demand bitfield | `0x20` (bit 5) set = commanded to run, `0` = off. Moves in lockstep with reg 0. |
+| **0** | Status bitfield | `0x1000` (bit 12) = commanded to run; set/cleared within 5s of the on/off write, ~140s before the compressor moves. Also takes **`0x2008`** (bits 13+3) during the standby self-check described below — a different pattern with no relation to run demand. |
+| **1** | Status bitfield | `0x20` (bit 5) = commanded to run, moving in lockstep with reg 0. Also takes **`0x04`** (bit 2) during the standby self-check. |
 | **25** | Command bitfield | bit 6 `0x40` = run demand; bit 1 `0x02` = fan commanded. Idle `0`, dwell `0x40` (64), running `0x42` (66). |
 | **26** | Command bitfield | bit 5 `0x20` = fan commanded; bit 0 `0x01` = compressor commanded. Idle `0`, fan only `0x20` (32), running `0x21` (33). |
 | **30** | Static | 28 on this firmware. Did not move across a full stop/start cycle — despite the value, it is **not** a mirror of the 785 state echo. |
-| **33**, **34** | Unpopulated sensor inputs | Both read `-1` (`0xFFFF`) as S_WORD. Same convention as reg 81's -58 for the absent tank sensor. Read these as signed. |
+| **33** | Unknown | Reads `-1` (`0xFFFF`) almost always, but takes the value **3** for five minutes during the standby self-check — so it is **not** an unpopulated sensor input, despite the resting value. Read as signed. |
+| **34** | Probably unpopulated sensor input | Reads `-1` (`0xFFFF`) constantly, including through the self-check. Same convention as reg 81's -58 for the absent tank sensor. Read as signed. |
 | **36** | Static | 1. |
 | **39** | **Compressor demand frequency** | Hz. The control law's output — what the controller *wants*. Steps directly to the new target. |
 | **40** | **Ramp-limited frequency setpoint** | Hz. What is actually fed to the inverter. Rate-limited to **5 Hz per 5 s on deceleration**; on acceleration it steps straight to the demand and the drive's own ramp limits the actual. |
@@ -157,6 +158,36 @@ status/fault bitmap, and it is the most promising place yet found for the
 undecoded E-codes and the defrost flag. Bit 12 of reg 0 and bit 5 of reg 1 are
 now known to mean "run demand"; the remaining 30 bits are unmapped because
 this unit has not faulted.
+
+### Standby self-check (registers 0, 1, 2, 25, 33)
+
+With the unit powered off, compressor and pump idle, the controller runs a
+**five-minute routine** that briefly lights registers otherwise assumed dead.
+Captured twice on 2026-09-12, identical in sequence and timing:
+
+| offset | change |
+|---|---|
+| +0s | reg 1 → 4, reg 25 → 64 |
+| +95s | reg 0 → 8200, reg 2 → 4 |
+| +100s | reg 33 → 3 |
+| +120s | reg 1 → 0 |
+| +145s | reg 25 → 0 |
+| +300s | reg 0 → 0, reg 2 → 0, reg 33 → -1 |
+
+Observed at 03:33:02Z and 15:38:48Z — 12h05m apart, so probably a fixed
+internal timer rather than anything tied to pump or heater state. Nothing
+starts: the compressor never turns, the pump is unaffected, and the protection
+bits stay at 1 throughout. Reg 25 bit 6 is the run-demand bit, asserted for two
+minutes without any demand being acted on, which is what suggests a self-check —
+plausibly the freeze-protection sampling these controllers run on a schedule.
+
+**Reg 2 appears nowhere else.** It reads 0 in every other condition logged,
+which is why earlier surveys of an idle machine listed it as empty.
+
+This is the clearest illustration of why the v1.4.0 continuous capture exists.
+Every earlier survey sampled a machine that was either idle or running steadily,
+and this routine is invisible in both — it needs something watching during the
+five minutes a day when it happens.
 
 ### Protection status registers (96-99)
 
@@ -233,8 +264,12 @@ Ranges 0-59 and 786-800 were swept on 2026-09-10 with
 are in the command/status block above. The bus answered cleanly throughout —
 no Modbus exceptions — so these are real, implemented registers.
 
-Of the 60 registers in 0-59, twelve are live: 0, 1, 25, 26, 29, 30, 33, 34,
-36, 39, 40. In 786-800, only 786 (constant 26). Everything else reads zero.
+Of the 60 registers in 0-59, **thirteen** are live: 0, 1, 2, 25, 26, 29, 30,
+33, 34, 36, 39, 40. In 786-800, only 786 (constant 26). Everything else reads
+zero in every condition logged so far.
+
+Reg 2 was only found once continuous capture was running - it is non-zero for
+five minutes a day during the standby self-check and zero the rest of the time.
 
 Since v1.4.0 the **production config captures 0-59 every cycle** as a single
 frame, so the overlay is no longer needed for these ranges. Decoded registers
