@@ -12,6 +12,8 @@ If your unit is configured for °C, it presumably reports all temperature regist
 - Update `unit_of_measurement: "°F"` to `unit_of_measurement: "°C"` on all temperature sensors in the YAML
 - Update the setpoint ranges in the `number:` entities accordingly (47-83°F → ~8-28°C for Cool, etc.)
 
+The °F reading is independently corroborated: register 74 (ambient) tracked a separate outdoor sensor within 1–2°F across a 13 h run (61.8 vs 64.0, 60.0 vs 61.2 in the evening). Registers 74–78 are raw `U_WORD` with no scaling applied, so **1 count = 1°F** — which sets the resolution floor for anything derived from them (see the superheat caveat below).
+
 The unit's temperature display mode can typically be changed in the settings menu. Whether this affects Modbus register values or only the display has not been verified — contributions from C° users welcome.
 
 ## Bus parameters
@@ -53,8 +55,8 @@ The unit's temperature display mode can typically be changed in the settings men
 | 68 | **AC line voltage** | V | RMS mains. Measured over two full runs: idle mean 236.9V, running mean 237.3V — **no load-dependent rise**. Useful brownout / P8-P10 / P26 early warning. (An earlier revision of this document claimed reg 68 was post-PFC and rose under load. That was wrong; the PFC bus is reg 72.) |
 | 69 | **AC input current** | ×0.1 A | Confirmed against an external power meter, 1499 samples: `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702, vs `W = 22.09 × reg69`, r²=0.9594. Including line voltage improves the fit — the signature of a current, not a power. Measured scale 0.095 A/count vs nominal 0.1; see caveat below. |
 | 70 | Compressor load index — **scale undecoded** | — | Hard-gated to 0 with the compressor. **Tracks compressor speed almost 1:1**: across a clean ramp on 2026-09-12, `reg70 = 1.072 x regHz + 12.3`, r2 = 0.968, with 42→78 Hz producing 60→96 counts. On top of that it drifts upward at *constant* speed as lift rises — 78 Hz held for eight hours on 2026-09-08 while reg 70 climbed 95→104 tracking condensing temperature, so the offset above speed runs ~13 early in a run and ~26 late. So `reg70 = f(speed) + g(lift)`, the signature of a load or torque index rather than a power measurement. Not a current in 0.1 A units: 96 implies 9.6 A against ~10.5 A of DC bus current at full speed, but at 42 Hz it predicts 3.8 A where the register says 6.0. Reliable as a boolean (non-zero = transferring heat). |
-| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. Medium-high confidence; not yet checked against a gauge set. |
-| 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
+| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach **early in a run only** — see the 13 h capture below, where condensing held 94–97°F while outlet water climbed 78.8→90.5°F, so the approach decayed 16.9→4.2°F. Condensing temperature is pinned by the controller, not dragged up by water temperature; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. Medium-high confidence; not yet checked against a gauge set. |
+| 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Confirmed over a 13 h continuous run on 2026-09-14: **378.3 V flat for the entire run** (hourly means 378.2–378.3), dropping to 332.6 V at idle. The running value is regulated tightly enough that any drift is itself diagnostic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
 | 74 | Ambient temp | °F | |
 | 75 | Coiler temp (outdoor evaporator) | °F | |
 | 76 | Incoiler temp (indoor heat exchanger) | °F | |
@@ -158,6 +160,63 @@ status/fault bitmap, and it is the most promising place yet found for the
 undecoded E-codes and the defrost flag. Bit 12 of reg 0 and bit 5 of reg 1 are
 now known to mean "run demand"; the remaining 30 bits are unmapped because
 this unit has not faulted.
+
+### Sustained run: 13 hours, 2026-09-14
+
+The longest continuous capture to date, and the only one that exercises the sensor
+registers across their full working range. One uninterrupted heat call, 06:47→19:59
+(13.19 h), water 73.4→86.7°F, ambient 60–70°F, 58.0 kWh at the meter. The compressor
+sat at 82 Hz — its maximum — for all but the first and last half hour, so this is a
+constant-speed sweep with only the lift changing.
+
+| hour | outlet °F | reg 71 cond | approach | evap SH | reg 66 EEV | reg 72 bus | reg 69 |
+|---|---|---|---|---|---|---|---|
+| 06:30* | 74.5 | 81.3 | 8.3 | 9.8 | 153 | 352.4 | 96 |
+| 07:00 | 78.8 | 95.9 | 16.9 | 2.4 | 178 | 378.3 | 195 |
+| 09:00 | 81.5 | 95.0 | 13.6 | 1.5 | 163 | 378.3 | 196 |
+| 11:00 | 83.9 | 94.7 | 10.8 | 1.3 | 152 | 378.3 | 198 |
+| 13:00 | 86.5 | 97.0 | 10.2 | 0.9 | 151 | 378.3 | 201 |
+| 15:00 | 88.5 | 97.6 | 9.2 | 1.0 | 149 | 378.3 | 192 |
+| 17:00 | 89.5 | 95.6 | 6.0 | ~0 | — | 378.3 | 208 |
+| 19:00 | 90.4 | 94.1 | 4.2 | ~0 | 285 | 377.9 | 208 |
+
+\* 06:30 row is the ramp-up bucket — compressor still climbing to speed, PFC not yet
+at its regulated value, superheat not yet pulled down.
+
+Four things this establishes:
+
+1. **Reg 72 is regulated, not merely "high while running."** 378.3 V held flat for
+   thirteen hours. Combined with the 332.6 V idle reading this is the strongest
+   confirmation yet that reg 72 is the PFC bus and not an energy accumulator.
+
+2. **Condensing temperature is pinned, and the approach collapses.** Reg 71 stayed
+   inside 94–97°F for the whole run while outlet water rose nearly 12°F beneath it.
+   The approach therefore fell 16.9→4.2°F. This is the unit's capacity wall: heat
+   transfer scales with that approach, so the water-temperature rise decayed from
+   ~1.4°F/h to ~0.2°F/h even though input power was constant. Practical ceiling for
+   this unit is condensing temperature minus a few degrees, i.e. low 90s°F.
+
+3. **The EEV closes against falling superheat.** Reg 66 went 178→149 steps across the
+   run — the controller closing the valve, the correct response to low superheat —
+   while the derived evaporator superheat still fell from ~10°F during the first half
+   hour to ~0 for the last three.
+   The valve reopens to 285 steps during the shutdown ramp. Whether ~0°F superheat is
+   this unit's deliberate design point (maximising capacity) or a charge issue is not
+   resolvable from register data alone; a gauge set would settle it.
+
+4. **Reg 69 rises with lift at constant speed.** Input current went 195→208 (×0.1 A)
+   across the run, consistent with the reg 69 = current decode: same compressor speed,
+   higher condensing pressure, more work. The trend is not monotonic — the 15:00 sample
+   dips to 192 — because the controller trims speed slightly against its own setpoint,
+   so this is a tendency across the run rather than a clean correlation.
+
+> [!WARNING]
+> **Derived superheat has a ±2°F resolution floor.** Evaporator superheat is computed
+> as reg 77 − reg 75, and both are integer °F registers, so each contributes ±1°F.
+> Values below about 2°F cannot be distinguished from zero, and a small negative
+> reading is not evidence of flooding. The *trend* across this run (~10°F → ~0) is far
+> larger than the error and is real; the sign at the end is not. Treat the derived
+> superheat and condenser-approach sensors as trend indicators, not instruments.
 
 ### Standby self-check (registers 0, 1, 2, 25, 33)
 
