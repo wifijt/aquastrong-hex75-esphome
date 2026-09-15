@@ -196,13 +196,27 @@ Four things this establishes:
    ~1.4°F/h to ~0.2°F/h even though input power was constant. Practical ceiling for
    this unit is condensing temperature minus a few degrees, i.e. low 90s°F.
 
-3. **The EEV closes against falling superheat.** Reg 66 went 178→149 steps across the
-   run — the controller closing the valve, the correct response to low superheat —
-   while the derived evaporator superheat still fell from ~10°F during the first half
-   hour to ~0 for the last three.
-   The valve reopens to 285 steps during the shutdown ramp. Whether ~0°F superheat is
-   this unit's deliberate design point (maximising capacity) or a charge issue is not
-   resolvable from register data alone; a gauge set would settle it.
+3. **The EEV regulates discharge temperature, not suction superheat.** Reg 66 closed
+   178→150 steps between 07:00 and 10:00 while discharge temperature climbed
+   170→185°F — and then both stopped moving. Across 10:00–19:00 discharge held
+   **183.3°F, sd 1.05** with the valve parked at 151 ± 2 steps. Discharge is the most
+   tightly regulated quantity in the machine, by coefficient of variation:
+
+   | quantity | CV over 10:00–19:00 |
+   |---|---|
+   | discharge temp | **0.57 %** |
+   | condensing temp | 1.32 % |
+   | ambient | 2.98 % |
+   | evaporator coil | 3.48 % |
+
+   That is the signature of a controller targeting discharge temperature: close the
+   valve until discharge reaches setpoint, then hold, and let suction superheat land
+   where it may. It makes engineering sense — discharge temperature is what damages a
+   compressor, and it is measurable with a cheap surface sensor, whereas true suction
+   superheat needs a pressure transducer this class of unit does not have. Liquid
+   return is handled by the suction accumulator instead. 183°F discharge against 96°F
+   condensing is healthy, and far too hot to be consistent with a flooded evaporator.
+   The valve reopens to 285 steps during the shutdown ramp.
 
 4. **Reg 69 rises with lift at constant speed.** Input current went 195→208 (×0.1 A)
    across the run, consistent with the reg 69 = current decode: same compressor speed,
@@ -211,12 +225,20 @@ Four things this establishes:
    so this is a tendency across the run rather than a clean correlation.
 
 > [!WARNING]
-> **Derived superheat has a ±2°F resolution floor.** Evaporator superheat is computed
-> as reg 77 − reg 75, and both are integer °F registers, so each contributes ±1°F.
-> Values below about 2°F cannot be distinguished from zero, and a small negative
-> reading is not evidence of flooding. The *trend* across this run (~10°F → ~0) is far
-> larger than the error and is real; the sign at the end is not. Treat the derived
-> superheat and condenser-approach sensors as trend indicators, not instruments.
+> **The derived "evaporator superheat" is unvalidated and probably is not superheat.**
+> It is computed as reg 77 − reg 75. Closing an EEV must *raise* true suction
+> superheat, yet across this run the valve closed 178→150 while the computed value
+> fell. Both cannot be true. The likely explanation is that reg 75 does not read
+> saturated evaporating temperature: if it sits at or near the evaporator outlet, or on
+> a return bend already in the superheated region, then coil ≈ suction by construction
+> and the 1–2°F difference is line pickup, not superheat. Consistent with that, reg 75
+> and reg 77 track within 1–2°F for the entire run and never diverge.
+>
+> Resolution compounds it — both registers are integer °F, so the difference carries
+> ±2°F and anything under ~2°F is indistinguishable from zero. **Do not read a small or
+> negative value as evidence of flooding.** Confirming what reg 75 actually measures
+> needs a gauge set: suction pressure gives the true saturation temperature. The same
+> caution applies to the derived condenser approach, which depends on reg 71.
 
 ### Standby self-check (registers 0, 1, 2, 25, 33)
 
