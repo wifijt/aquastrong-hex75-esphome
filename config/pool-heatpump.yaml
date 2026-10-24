@@ -23,7 +23,7 @@ esphome:
   friendly_name: Pool Heat Pump
   project:
     name: esphome.pool_heatpump
-    version: "1.5.0"
+    version: "1.6.0"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -287,6 +287,70 @@ text_sensor:
       snprintf(buf, sizeof(buf), "Fault 0x%04X (%d)", f, f);
       return std::string(buf);
 
+  # What the heat pump is doing, one word. First match wins:
+  #   Defrosting   - the fan-stopped defrost detector
+  #   Anti-Freeze  - reg 0 bit 1 or 2 with the power switch OFF. Bit 1 is
+  #                  ambient-driven, so it might also set during a normal
+  #                  powered heat call on a cold day; that has never been
+  #                  observed, so powered-on runs fall through to the mode.
+  #   Heating / Cooling - compressor turning, by mode. Auto is inferred
+  #                  from inlet water vs the auto setpoint (unverified).
+  #   Idle         - powered on, compressor stopped
+  #   Off          - powered off
+  # Health is separate: see Fault and Protection Status.
+  - platform: template
+    name: "Pool Heater Status"
+    id: heater_status
+    icon: mdi:heat-pump-outline
+    update_interval: 5s
+    lambda: |-
+      if (!id(reg_comp_freq).has_state() || !id(cmd_bits_0).has_state()) return {};
+      if (id(defrosting).state) return std::string("Defrosting");
+      int bits = (int) id(cmd_bits_0).state;
+      if (id(cache_power) == 0 && (bits & 0x0006)) return std::string("Anti-Freeze");
+      if (id(reg_comp_freq).state > 0) {
+        if (id(cache_mode) == 1) return std::string("Heating");
+        if (id(cache_mode) == 0) return std::string("Cooling");
+        if (id(reg_inlet_water).has_state() &&
+            id(reg_inlet_water).state < id(cache_auto_setpoint))
+          return std::string("Heating");
+        return std::string("Cooling");
+      }
+      return std::string(id(cache_power) == 1 ? "Idle" : "Off");
+
+  # Anti-freeze detail behind Status = Anti-Freeze.
+  #   Off          - neither bit
+  #   Pump cycling - reg 0 bit 1, stage 1: ambient below ~42 F, pump asked
+  #                  for 3 min on / 10 min off
+  #   Heating      - reg 0 bit 2, stage 2: compressor running with the
+  #                  power switch off, seen when stagnant inlet water hit
+  #                  38 F; ends with stage 1, when the AIR warms
+  # Transitions are logged at WARN with the conditions and register map.
+  - platform: template
+    name: "Pool Heater Anti-Freeze Stage"
+    id: anti_freeze_stage
+    entity_category: diagnostic
+    icon: mdi:snowflake-alert
+    update_interval: 5s
+    lambda: |-
+      if (!id(cmd_bits_0).has_state()) return {};
+      int bits = (int) id(cmd_bits_0).state;
+      std::string stage = (bits & 0x0004) ? "Heating"
+                        : (bits & 0x0002) ? "Pump cycling" : "Off";
+      static std::string prev;
+      if (stage != prev) {
+        if ((bits & 0x0004) && !(bits & 0x0002))
+          ESP_LOGW("pool", "ANTI-FREEZE: bit 2 without bit 1 (reg0=0x%04X) - not seen before", bits);
+        ESP_LOGW("pool", "ANTI-FREEZE: %s -> %s amb=%.0fF inlet=%.0fF coil=%.0fF "
+                 "dis=%.0fF flow=%.0f regs[%s]",
+                 prev.empty() ? "boot" : prev.c_str(), stage.c_str(),
+                 id(reg_ambient).state, id(reg_inlet_water).state,
+                 id(reg_coiler).state, id(reg_discharge).state,
+                 id(reg_fault).state, id(raw_register_map).state.c_str());
+        prev = stage;
+      }
+      return stage;
+
   # Conditions latched at the last defrost START. A defrost lasts minutes
   # then everything returns to normal; this keeps the event legible later.
   # If a defrost flag register exists, it is in the map captured here.
@@ -452,43 +516,8 @@ binary_sensor:
       if (!id(cmd_bits_25).has_state()) return {};
       return ((int) id(cmd_bits_25).state & 0x0040) != 0;
 
-  # Reg 0 bit 1: anti-freeze stage 1. Sets at ~42 F unit ambient, clears
-  # at ~44-46 F. Overrides the power switch.
-  - platform: template
-    name: "Pool Heater Anti-Freeze"
-    id: anti_freeze
-    device_class: cold
-    icon: mdi:snowflake-alert
-    lambda: |-
-      if (!id(cmd_bits_0).has_state()) return {};
-      return ((int) id(cmd_bits_0).state & 0x0002) != 0;
-
-  # Reg 0 bit 2: anti-freeze stage 2 - compressor heating, with the power
-  # switch off. Seen when stagnant inlet water reached 38 F; ends with
-  # stage 1, i.e. when the AIR warms, not the water.
-  - platform: template
-    name: "Pool Heater Anti-Freeze Heating"
-    id: anti_freeze_heating
-    device_class: heat
-    icon: mdi:snowflake-thermometer
-    lambda: |-
-      if (!id(cmd_bits_0).has_state()) return {};
-      return ((int) id(cmd_bits_0).state & 0x0004) != 0;
-    on_press:
-      then:
-        - lambda: |-
-            ESP_LOGW("pool", "ANTI-FREEZE HEATING START: amb=%.0fF inlet=%.0fF "
-                     "coil=%.0fF flow=%.0f regs[%s]",
-                     id(reg_ambient).state, id(reg_inlet_water).state,
-                     id(reg_coiler).state, id(reg_fault).state,
-                     id(raw_register_map).state.c_str());
-    on_release:
-      then:
-        - lambda: |-
-            ESP_LOGW("pool", "ANTI-FREEZE HEATING END: amb=%.0fF inlet=%.0fF "
-                     "coil=%.0fF dis=%.0fF",
-                     id(reg_ambient).state, id(reg_inlet_water).state,
-                     id(reg_coiler).state, id(reg_discharge).state);
+  # Anti-freeze (reg 0 bits 1 and 2) is decoded into the "Anti-Freeze
+  # Stage" and "Status" text sensors under text_sensor:.
 
   # Reg 0 bits 13+3 (0x2008, with reg 2 = 4 and reg 33 = 3): the pump was
   # commanded but the flow switch never closed. Clears the instant flow
@@ -1345,7 +1374,8 @@ sensor:
   #   reg 0  0x2008 = pump requested but no flow
   #   reg 25 bit 6 = WATER PUMP command, bit 1 = fan
   #   reg 26 bit 5 = fan, bit 0 = compressor
-  # Decoded into binary sensors under binary_sensor:. Remaining bits
+  # Decoded into Status / Anti-Freeze Stage (text_sensor:) and Pump
+  # Command / No Flow On Pump Request (binary_sensor:). Remaining bits
   # unmapped only because this unit has not faulted.
   - platform: template
     name: "Pool Heater Command Bits 0"
