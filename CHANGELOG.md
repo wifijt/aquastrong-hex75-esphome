@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.6.0 — Heater Status
+
+### New
+
+- **Status** (text): one answer to "what is the heat pump doing?"
+  It shows `Defrosting`, `Anti-Freeze`, `Heating`, `Cooling`, `Idle` or
+  `Off`, and the first match wins in that order. `Anti-Freeze` is reported
+  only with the power switch off: stage 1 is driven by ambient temperature,
+  and we have never seen it during a powered heat call. In Auto mode,
+  heating vs cooling is inferred from inlet water vs the auto setpoint
+  (unverified). Faults stay on Fault / Protection Status.
+- **Anti-Freeze Stage** (text, diagnostic): `Off`, `Pump cycling`
+  (reg 0 bit 1) or `Heating` (reg 0 bit 2). Every transition is logged at
+  WARN with the conditions and the register map.
+
+### Removed
+
+- The **Anti-Freeze** and **Anti-Freeze Heating** binary sensors from
+  v1.5.0. Their `cold` / `heat` device classes made Home Assistant show
+  "Cold" / "Hot", which read as temperatures rather than a mode. They are
+  replaced by the two text sensors above. Delete the orphaned entities in
+  Home Assistant after flashing.
+
 ## v1.5.0 — Anti-freeze and pump command decode
 
 Decodes what the controller does when it gets cold, from two anti-freeze
