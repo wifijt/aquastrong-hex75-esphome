@@ -12,7 +12,7 @@
 #           neighbourhood. On these OEM boards the fault-code block is almost
 #           always contiguous with the status word, so 0-28 and 30-59 are the
 #           highest-probability location for the undecoded E-codes.
-#   786-800 Immediately past the 785 state echo, at the top of the control
+#   786-800 Immediately past reg 785 (undecoded), at the top of the control
 #           block. Second-most-likely spot for mode/state flags.
 #
 # HOW TO USE

@@ -42,7 +42,7 @@ The unit's temperature display mode can typically be changed in the settings men
 | 775 | 0x0307 | Energy mode | 0=Standard, 1=Boost, 2=Eco |
 | 776 | 0x0308 | Version flag | 0x3B (always) |
 | 779 | 0x030B | Auto setpoint | 47-104°F |
-| 785 | 0x0311 | Running state echo | see below |
+| 785 | 0x0311 | Undecoded (formerly "running state echo") | see below |
 
 ### Sensors (registers 29-98)
 
@@ -54,8 +54,8 @@ The unit's temperature display mode can typically be changed in the settings men
 | 66 | EEV opening | steps | |
 | 68 | **AC line voltage** | V | RMS mains. Measured over two full runs: idle mean 236.9V, running mean 237.3V — **no load-dependent rise**. Useful brownout / P8-P10 / P26 early warning. (An earlier revision of this document claimed reg 68 was post-PFC and rose under load. That was wrong; the PFC bus is reg 72.) |
 | 69 | **AC input current** | ×0.1 A | Confirmed against an external power meter, 1499 samples: `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702, vs `W = 22.09 × reg69`, r²=0.9594. Including line voltage improves the fit — the signature of a current, not a power. Measured scale 0.095 A/count vs nominal 0.1; see caveat below. |
-| 70 | Compressor load index — **scale undecoded** | — | Hard-gated to 0 with the compressor. **Tracks compressor speed almost 1:1**: across a clean ramp on 2026-09-12, `reg70 = 1.072 x regHz + 12.3`, r2 = 0.968, with 42→78 Hz producing 60→96 counts. On top of that it drifts upward at *constant* speed as lift rises — 78 Hz held for eight hours on 2026-09-08 while reg 70 climbed 95→104 tracking condensing temperature, so the offset above speed runs ~13 early in a run and ~26 late. So `reg70 = f(speed) + g(lift)`, the signature of a load or torque index rather than a power measurement. Not a current in 0.1 A units: 96 implies 9.6 A against ~10.5 A of DC bus current at full speed, but at 42 Hz it predicts 3.8 A where the register says 6.0. Reliable as a boolean (non-zero = transferring heat). |
-| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach **early in a run only** — see the 13 h capture below, where condensing held 94–97°F while outlet water climbed 78.8→90.5°F, so the approach decayed 16.9→4.2°F. Condensing temperature is pinned by the controller, not dragged up by water temperature; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. **Confidence lowered** by the anti-freeze runs (see below): reg 71 read 33–35°F for hours while 48–50°F water flowed through the condenser, which is impossible for a high-side saturation temperature in a cycle that is heating that water. Either it is not what it seems or little heat is reaching the water in that mode. Needs a gauge set. |
+| 70 | Compressor load index — **scale undecoded** | — | Hard-gated to 0 with the compressor. **Tracks compressor speed almost 1:1**: across a clean ramp on 2026-09-12, `reg70 = 1.072 x regHz + 12.3`, r2 = 0.968, with 42→78 Hz producing 60→96 counts. On top of that it drifts upward at *constant* speed as lift rises — 78 Hz held for eight hours on 2026-09-08 while reg 70 climbed 95→104 tracking condensing temperature, so the offset above speed runs ~13 early in a run and ~26 late. So `reg70 = f(speed) + g(lift)`, the signature of a load or torque index rather than a power measurement. Not a current in 0.1 A units: 96 implies 9.6 A against ~10.5 A of DC bus current at 78 Hz, but at 42 Hz it predicts 3.8 A where the register says 6.0. Reliable as a boolean (non-zero = transferring heat). |
+| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach **early in a run only** — see the 13 h capture below, where condensing held 93–98°F while outlet water climbed 78.8→90.4°F, so the approach decayed 16.9→4.2°F. Condensing temperature is pinned by the controller, not dragged up by water temperature; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. **Confidence lowered** by the anti-freeze runs (see below): reg 71 read 33–35°F for hours while 48–50°F water flowed through the condenser, which is impossible for a high-side saturation temperature in a cycle that is heating that water. Either it is not what it seems or little heat is reaching the water in that mode. Needs a gauge set. |
 | 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Confirmed over a 13 h continuous run on 2026-09-14: **378.3 V flat for the entire run** (hourly means 378.2–378.3), dropping to 332.6 V at idle. The running value is regulated tightly enough that any drift is itself diagnostic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
 | 74 | Ambient temp | °F | |
 | 75 | Coiler temp (outdoor evaporator) | °F | Signed. Reached −26°F in anti-freeze mode. |
@@ -104,7 +104,7 @@ are command words, not measurements of what the machine is doing.
 | **2** | Status | `4` while the reg 0 no-flow flag (`0x2008`) is set, `0` otherwise. |
 | **25** | Command bitfield | bit 6 `0x40` = **water pump command**; bit 1 `0x02` = fan commanded; bit 10 `0x400` = set ~7 min into an anti-freeze heating run and held until it ends. Idle `0`, pump only `0x40` (64), running `0x42` (66), anti-freeze heating `0x442` (1090). Bit 6 was earlier read as "run demand"; it is the pump output, which is why it leads the fan and compressor bits on every start. |
 | **26** | Command bitfield | bit 5 `0x20` = fan commanded; bit 0 `0x01` = compressor commanded. Idle `0`, fan only `0x20` (32), running `0x21` (33). |
-| **30** | Static | 28 on this firmware. Did not move across a full stop/start cycle — despite the value, it is **not** a mirror of the 785 state echo. |
+| **30** | Static | 28 on this firmware. Did not move across a full stop/start cycle — despite the value, it is **not** a mirror of reg 785. |
 | **33** | Unknown | Reads `-1` (`0xFFFF`) normally, and **3** whenever the reg 0 no-flow flag is set — for five minutes, or for days when the flag latches. Not an unpopulated sensor input, despite the resting value. Read as signed. |
 | **34** | Probably unpopulated sensor input | Reads `-1` (`0xFFFF`) constantly, including through the self-check. Same convention as reg 81's -58 for the absent tank sensor. Read as signed. |
 | **36** | Static | 1. |
@@ -166,9 +166,11 @@ no-flow); the remaining 24 bits are unmapped because this unit has not faulted.
 
 The longest continuous capture to date, and the only one that exercises the sensor
 registers across their full working range. One uninterrupted heat call, 06:47→19:59
-(13.19 h), water 73.4→86.7°F, ambient 60–70°F, 58.0 kWh at the meter. The compressor
-sat at 82 Hz — its maximum — for all but the first and last half hour, so this is a
-constant-speed sweep with only the lift changing.
+(13.19 h), inlet water 73.4→86.7°F (outlet ~74→91°F), ambient 60–70°F, 58.0 kWh at
+the meter. The compressor ran at 82 Hz — the highest speed logged on this unit; other
+runs have topped out at 78 — apart from the ramps at each end and a step down to 78 Hz
+between about 13:30 and 16:30. So this is close to a constant-speed sweep with only
+the lift changing, but not exactly one.
 
 | hour | outlet °F | reg 71 cond | approach | evap SH | reg 66 EEV | reg 72 bus | reg 69 |
 |---|---|---|---|---|---|---|---|
@@ -184,17 +186,23 @@ constant-speed sweep with only the lift changing.
 \* 06:30 row is the ramp-up bucket — compressor still climbing to speed, PFC not yet
 at its regulated value, superheat not yet pulled down.
 
+The approach column is the hourly mean of per-sample condensing − outlet, so it can
+differ by ~0.5°F from the difference of the two column means (19:00: 4.2 vs 94.1 −
+90.4 = 3.7). Home Assistant's recorded Condenser Approach sensor agrees with the
+column (4.1°F for that hour).
+
 Four things this establishes:
 
 1. **Reg 72 is regulated, not merely "high while running."** 378.3 V held flat for
    thirteen hours. Combined with the 332.6 V idle reading this is the strongest
    confirmation yet that reg 72 is the PFC bus and not an energy accumulator.
 
-2. **Condensing temperature is pinned, and the approach collapses.** Reg 71 stayed
-   inside 94–97°F for the whole run while outlet water rose nearly 12°F beneath it.
-   The approach therefore fell 16.9→4.2°F. This is the unit's capacity wall: heat
-   transfer scales with that approach, so the water-temperature rise decayed from
-   ~1.4°F/h to ~0.2°F/h even though input power was constant. Practical ceiling for
+2. **Condensing temperature is pinned, and the approach collapses.** Reg 71's hourly
+   means stayed inside 93–98°F for the whole run while outlet water rose nearly 12°F
+   beneath it. The approach therefore fell 16.9→4.2°F. This is the unit's capacity
+   wall: heat transfer scales with that approach, so the water-temperature rise
+   decayed from ~1.4°F/h to ~0.2°F/h even though input current held at 19–21 A
+   throughout. Practical ceiling for
    this unit is condensing temperature minus a few degrees, i.e. low 90s°F.
 
 3. **The EEV regulates discharge temperature, not suction superheat.** Reg 66 closed
@@ -219,11 +227,11 @@ Four things this establishes:
    condensing is healthy, and far too hot to be consistent with a flooded evaporator.
    The valve reopens to 285 steps during the shutdown ramp.
 
-4. **Reg 69 rises with lift at constant speed.** Input current went 195→208 (×0.1 A)
+4. **Reg 69 rises with lift at a given speed.** Input current went 195→208 (×0.1 A)
    across the run, consistent with the reg 69 = current decode: same compressor speed,
-   higher condensing pressure, more work. The trend is not monotonic — the 15:00 sample
-   dips to 192 — because the controller trims speed slightly against its own setpoint,
-   so this is a tendency across the run rather than a clean correlation.
+   higher condensing pressure, more work. The one dip — 192 at 15:00 — is the
+   compressor's step down from 82 to 78 Hz between about 13:30 and 16:30; current
+   climbs again once it returns to 82.
 
 > [!WARNING]
 > **The derived "evaporator superheat" is unvalidated and probably is not superheat.**
@@ -401,7 +409,7 @@ Also updates at end of run cycles. Contains small values (1-9) and mirrors of op
 | 2058-2059 | 0, 0 | Empty |
 | 2060 | 104 | Mirrors upper setpoint bound |
 | 2061 | 9 | Unknown |
-| 2062 | 30 | Mirrors running state value |
+| 2062 | 30 | Unknown. Earlier read as mirroring reg 785, which is itself undecoded |
 | 2063 | 5 | Unknown |
 
 ### Empty ranges
@@ -558,9 +566,9 @@ The Tuya app displays a "Defrosting" status when the unit runs a defrost cycle (
 
 **We have not yet identified the register that reports defrost state.** Possibilities:
 
-- An additional bit in 0x0311 (state echo)
+- An unmapped bit in the reg 0 / reg 1 status bitfields
 - A separate flag register we haven't surveyed
-- Encoded into one of the unknown registers (68, 69, 71, 83)
+- Encoded into one of the still-undecoded registers (83, 785)
 - Inferred by the Tuya WiFi module from refrigerant temperature patterns rather than a dedicated register
 
 To find it, watch the diagnostic register dumps during a defrost event. Defrost is typically characterized by:
@@ -696,7 +704,7 @@ The controller may reject values outside these ranges. The provided ESPHome conf
 
 ## Polling rate
 
-The OEM display polls multiple register ranges every ~200ms. The included ESPHome config polls every 2 seconds, which is more than enough for HA-level control and reduces bus traffic.
+The OEM display polls multiple register ranges every ~200ms. The included ESPHome config polls every 5 seconds, which is more than enough for HA-level control and reduces bus traffic.
 
 ## Why dual-bus?
 
@@ -747,7 +755,7 @@ commands are never sent, so the retry counter never moves).
 ### Frame count guidance
 
 Bus time is dominated by per-frame throttle slots, not data bytes. A
-A 21-register read costs one `command_throttle` slot — the same as a
+21-register read costs one `command_throttle` slot — the same as a
 1-register read. Modbus allows up to **125 registers per read**, so a wide
 contiguous block is nearly free while a scattered handful is not. When adding
 sensors, pad gaps with `internal: true` sensors so contiguous blocks read as
