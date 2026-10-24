@@ -27,7 +27,8 @@ This project replaces the Tuya cloud integration with a fully local, fully contr
 
 - **Full local control**: power, mode (Cool/Heat/Auto), all three setpoints, energy mode (Standard/Boost/Eco)
 - **Complete sensor visibility**: water inlet/outlet, full refrigerant circuit, compressor and fan frequencies, EEV opening, AC line voltage and input current, DC bus voltage
-- **Derived diagnostics**: evaporator and discharge superheat, condenser approach, input apparent power — the numbers you would otherwise need a gauge set and a clamp meter for
+- **Derived diagnostics**: discharge superheat, condenser approach, input apparent power — the numbers you would otherwise need a gauge set and a clamp meter for (an "evaporator superheat" sensor is included but unvalidated; see [docs/PROTOCOL.md](docs/PROTOCOL.md))
+- **Anti-freeze visibility**: the controller's pump command and both anti-freeze stages, which run the compressor even with the unit switched off
 - **Inverter control chain**: compressor demand vs. ramp-limited setpoint vs. measured actual, so you can see *why* the unit is running at the speed it is
 - **Fault and defrost capture**: protection bits, a defrost detector, and latched snapshots of the full register map at the moment an event begins
 - **No cloud required**: Tuya can be left disabled or removed entirely
