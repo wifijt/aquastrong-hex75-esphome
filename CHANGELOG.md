@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.5.0 — Anti-freeze and pump command decode
+
+Decodes what the controller does when it gets cold, from two anti-freeze
+events captured with the unit powered off (2026-10-19 and 2026-10-24). Full
+evidence in `docs/PROTOCOL.md`. No new Modbus frames: everything comes from
+the 0-59 block already read every cycle.
+
+### Fixed
+
+- **Coiler (reg 75) and Suction (reg 77) are signed.** They were read as
+  `U_WORD`, so −26 °F showed up as 65510. Now `S_WORD`.
+
+### New binary sensors
+
+| Sensor | Source | Meaning |
+|---|---|---|
+| **Pump Command** | reg 25 bit 6 | The controller asking for the water pump. Previously read as "run demand". |
+| **Anti-Freeze** | reg 0 bit 1 | Stage 1: cold ambient (~42 °F). Pump cycles 3 min on / 10 min off. |
+| **Anti-Freeze Heating** | reg 0 bit 2 | Stage 2: compressor heating with the power switch **off**. Logs start and end at WARN. |
+| **No Flow On Pump Request** | reg 0 `0x2008` | Pump was commanded but the flow switch never closed. |
+
+If the pool pump is not wired to the controller's pump output, have Home
+Assistant turn it on from **Pump Command**. Without that, stage 1's pump
+requests go unanswered, the water standing in the unit cools to 38 °F, and the
+compressor starts without flow.
+
+### Changed
+
+- **Evaporator Superheat** is documented as unvalidated: reg 75 probably reads
+  already-superheated refrigerant, so suction − coil is not superheat. The
+  sensor is kept for continuity; do not read a small value as flooding.
+
 ## v1.4.0 — Command block in production, event capture
 
 Promotes the register 0-59 decode from the temporary survey overlay into the

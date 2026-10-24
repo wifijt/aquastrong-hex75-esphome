@@ -23,7 +23,7 @@ esphome:
   friendly_name: Pool Heat Pump
   project:
     name: esphome.pool_heatpump
-    version: "1.4.0"
+    version: "1.5.0"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -433,6 +433,74 @@ binary_sensor:
     lambda: |-
       if (!id(active_heating).has_state()) return {};
       return id(active_heating).state > 0;
+
+  # ------------------------------------------------------------------
+  # Command-bit decodes. All from the 0-59 block already being read.
+  # Full evidence in docs/PROTOCOL.md (pump sampling, anti-freeze).
+  # ------------------------------------------------------------------
+
+  # Reg 25 bit 6: the controller asking for the water pump. Leads the fan
+  # and compressor bits on every start, and cycles 3 min on / 10 min off
+  # in anti-freeze stage 1. If the pool pump is not wired to the
+  # controller, have Home Assistant follow this.
+  - platform: template
+    name: "Pool Heater Pump Command"
+    id: pump_command
+    device_class: running
+    icon: mdi:pump
+    lambda: |-
+      if (!id(cmd_bits_25).has_state()) return {};
+      return ((int) id(cmd_bits_25).state & 0x0040) != 0;
+
+  # Reg 0 bit 1: anti-freeze stage 1. Sets at ~42 F unit ambient, clears
+  # at ~44-46 F. Overrides the power switch.
+  - platform: template
+    name: "Pool Heater Anti-Freeze"
+    id: anti_freeze
+    device_class: cold
+    icon: mdi:snowflake-alert
+    lambda: |-
+      if (!id(cmd_bits_0).has_state()) return {};
+      return ((int) id(cmd_bits_0).state & 0x0002) != 0;
+
+  # Reg 0 bit 2: anti-freeze stage 2 - compressor heating, with the power
+  # switch off. Seen when stagnant inlet water reached 38 F; ends with
+  # stage 1, i.e. when the AIR warms, not the water.
+  - platform: template
+    name: "Pool Heater Anti-Freeze Heating"
+    id: anti_freeze_heating
+    device_class: heat
+    icon: mdi:snowflake-thermometer
+    lambda: |-
+      if (!id(cmd_bits_0).has_state()) return {};
+      return ((int) id(cmd_bits_0).state & 0x0004) != 0;
+    on_press:
+      then:
+        - lambda: |-
+            ESP_LOGW("pool", "ANTI-FREEZE HEATING START: amb=%.0fF inlet=%.0fF "
+                     "coil=%.0fF flow=%.0f regs[%s]",
+                     id(reg_ambient).state, id(reg_inlet_water).state,
+                     id(reg_coiler).state, id(reg_fault).state,
+                     id(raw_register_map).state.c_str());
+    on_release:
+      then:
+        - lambda: |-
+            ESP_LOGW("pool", "ANTI-FREEZE HEATING END: amb=%.0fF inlet=%.0fF "
+                     "coil=%.0fF dis=%.0fF",
+                     id(reg_ambient).state, id(reg_inlet_water).state,
+                     id(reg_coiler).state, id(reg_discharge).state);
+
+  # Reg 0 bits 13+3 (0x2008, with reg 2 = 4 and reg 33 = 3): the pump was
+  # commanded but the flow switch never closed. Clears the instant flow
+  # appears; times out after 5 min, but latches during anti-freeze.
+  - platform: template
+    name: "Pool Heater No Flow On Pump Request"
+    id: no_flow_on_pump_request
+    device_class: problem
+    icon: mdi:water-off
+    lambda: |-
+      if (!id(cmd_bits_0).has_state()) return {};
+      return ((int) id(cmd_bits_0).state & 0x2008) == 0x2008;
 
 # ====================================================================
 # Scripts
@@ -932,7 +1000,7 @@ sensor:
     id: reg_coiler
     address: 75
     register_type: holding
-    value_type: U_WORD
+    value_type: S_WORD          # signed: reads -26F in anti-freeze mode
     unit_of_measurement: "°F"
     device_class: temperature
     state_class: measurement
@@ -955,7 +1023,7 @@ sensor:
     id: reg_suction
     address: 77
     register_type: holding
-    value_type: U_WORD
+    value_type: S_WORD          # signed: reads -26F in anti-freeze mode
     unit_of_measurement: "°F"
     device_class: temperature
     state_class: measurement
@@ -1273,9 +1341,12 @@ sensor:
 
   # Command bitfields - every bit LEADS its physical event.
   #   reg 0  bit 12 = run demand      reg 1  bit 5 = run demand
-  #   reg 25 bit 6 = run demand, bit 1 = fan
+  #   reg 0  bit 1 = anti-freeze stage 1, bit 2 = stage 2 (compressor)
+  #   reg 0  0x2008 = pump requested but no flow
+  #   reg 25 bit 6 = WATER PUMP command, bit 1 = fan
   #   reg 26 bit 5 = fan, bit 0 = compressor
-  # Remaining bits unmapped only because this unit has not faulted.
+  # Decoded into binary sensors under binary_sensor:. Remaining bits
+  # unmapped only because this unit has not faulted.
   - platform: template
     name: "Pool Heater Command Bits 0"
     id: cmd_bits_0
@@ -1309,8 +1380,11 @@ sensor:
   # are already being read, so they cost no additional Modbus frames.
   # ------------------------------------------------------------------
 
-  # Evaporator superheat (outdoor coil is the evaporator in heat mode).
-  # Runs 2-3 F and steady; sustained drift means charge or EEV.
+  # "Evaporator superheat" = suction - coil. UNVALIDATED and probably not
+  # superheat: reg 75 seems to sit where the refrigerant is already
+  # superheated, so the two track within 1-2 F (integer F, so +/-2 F).
+  # Do not read a small or negative value as flooding or a charge problem.
+  # See the warning in docs/PROTOCOL.md.
   - platform: template
     name: "Pool Heater Evaporator Superheat"
     id: evap_superheat

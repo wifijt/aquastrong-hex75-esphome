@@ -12,6 +12,8 @@ If your unit is configured for °C, it presumably reports all temperature regist
 - Update `unit_of_measurement: "°F"` to `unit_of_measurement: "°C"` on all temperature sensors in the YAML
 - Update the setpoint ranges in the `number:` entities accordingly (47-83°F → ~8-28°C for Cool, etc.)
 
+The °F reading is independently corroborated: register 74 (ambient) tracked a separate outdoor sensor within 1–2°F across a 13 h run (61.8 vs 64.0, 60.0 vs 61.2 in the evening). Registers 74–78 are integer °F with no scaling applied, so **1 count = 1°F** — which sets the resolution floor for anything derived from them (see the superheat caveat below). They are **signed**: during the 2026-10-24 anti-freeze run regs 75 and 77 read `65510`, which is −26°F as a two's-complement `S_WORD`. The shipped config still reads them as `U_WORD` and needs changing.
+
 The unit's temperature display mode can typically be changed in the settings menu. Whether this affects Modbus register values or only the display has not been verified — contributions from C° users welcome.
 
 ## Bus parameters
@@ -53,12 +55,12 @@ The unit's temperature display mode can typically be changed in the settings men
 | 68 | **AC line voltage** | V | RMS mains. Measured over two full runs: idle mean 236.9V, running mean 237.3V — **no load-dependent rise**. Useful brownout / P8-P10 / P26 early warning. (An earlier revision of this document claimed reg 68 was post-PFC and rose under load. That was wrong; the PFC bus is reg 72.) |
 | 69 | **AC input current** | ×0.1 A | Confirmed against an external power meter, 1499 samples: `VA = 0.09501 × (reg69 × reg68)`, r²=0.9702, vs `W = 22.09 × reg69`, r²=0.9594. Including line voltage improves the fit — the signature of a current, not a power. Measured scale 0.095 A/count vs nominal 0.1; see caveat below. |
 | 70 | Compressor load index — **scale undecoded** | — | Hard-gated to 0 with the compressor. **Tracks compressor speed almost 1:1**: across a clean ramp on 2026-09-12, `reg70 = 1.072 x regHz + 12.3`, r2 = 0.968, with 42→78 Hz producing 60→96 counts. On top of that it drifts upward at *constant* speed as lift rises — 78 Hz held for eight hours on 2026-09-08 while reg 70 climbed 95→104 tracking condensing temperature, so the offset above speed runs ~13 early in a run and ~26 late. So `reg70 = f(speed) + g(lift)`, the signature of a load or torque index rather than a power measurement. Not a current in 0.1 A units: 96 implies 9.6 A against ~10.5 A of DC bus current at full speed, but at 42 Hz it predicts 3.8 A where the register says 6.0. Reliable as a boolean (non-zero = transferring heat). |
-| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. Medium-high confidence; not yet checked against a gauge set. |
-| 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
+| 71 | **Condensing temp (high-side saturated)** | °F | Idle 78.7 (equalised between 88°F water and 74°F ambient); running mean 101, tracking outlet water +10–15°F approach **early in a run only** — see the 13 h capture below, where condensing held 94–97°F while outlet water climbed 78.8→90.5°F, so the approach decayed 16.9→4.2°F. Condensing temperature is pinned by the controller, not dragged up by water temperature; collapses 104→78 within 2 min of shutdown — refrigerant equalisation, not thermal mass. **Confidence lowered** by the anti-freeze runs (see below): reg 71 read 33–35°F for hours while 48–50°F water flowed through the condenser, which is impossible for a high-side saturation temperature in a cycle that is heating that water. Either it is not what it seems or little heat is reaching the water in that mode. Needs a gauge set. |
+| 72 | **DC bus voltage** | V | **Not an energy counter.** Idle 336 = √2 × 237Vac (passive rectified peak, PFC idle); running 377–380, tightly regulated (PFC boost active). On start dips to 327 (precharge inrush) then 357→378 within 5s; on stop returns to ~336 within 5s. Never accumulates, non-monotonic. Confirmed over a 13 h continuous run on 2026-09-14: **378.3 V flat for the entire run** (hourly means 378.2–378.3), dropping to 332.6 V at idle. The running value is regulated tightly enough that any drift is itself diagnostic. Direct readout for the P7 / P8 / P9 / P38 bus faults. |
 | 74 | Ambient temp | °F | |
-| 75 | Coiler temp (outdoor evaporator) | °F | |
+| 75 | Coiler temp (outdoor evaporator) | °F | Signed. Reached −26°F in anti-freeze mode. |
 | 76 | Incoiler temp (indoor heat exchanger) | °F | |
-| 77 | Suction temp (refrigerant) | °F | |
+| 77 | Suction temp (refrigerant) | °F | Signed. Reached −26°F in anti-freeze mode. |
 | 78 | Discharge temp (refrigerant) | °F | |
 | 79 | Water temp display (smoothed) | °F | Mirrors inlet; used by display for readout |
 | 80 | **Outlet water temp** | °F | Confirmed against OEM display |
@@ -97,12 +99,13 @@ are command words, not measurements of what the machine is doing.
 
 | Register | Purpose | Values |
 |---|---|---|
-| **0** | Status bitfield | `0x1000` (bit 12) = commanded to run; set/cleared within 5s of the on/off write, ~140s before the compressor moves. Also takes **`0x2008`** (bits 13+3) during the standby self-check described below — a different pattern with no relation to run demand. |
-| **1** | Status bitfield | `0x20` (bit 5) = commanded to run, moving in lockstep with reg 0. Also takes **`0x04`** (bit 2) during the standby self-check. |
-| **25** | Command bitfield | bit 6 `0x40` = run demand; bit 1 `0x02` = fan commanded. Idle `0`, dwell `0x40` (64), running `0x42` (66). |
+| **0** | Status bitfield | bit 12 `0x1000` = commanded to run; set/cleared within 5s of the on/off write, ~140s before the compressor moves. bit 1 `0x0002` = **anti-freeze stage 1** (cold ambient). bit 2 `0x0004` = **anti-freeze stage 2** (compressor heating). bits 13+3 `0x2008` = **pump requested but no flow** (see the pump sampling cycle). bit 8 `0x0100` = toggles every ~95s during anti-freeze heating, pulling demand from 60 to 40 Hz; meaning unknown. |
+| **1** | Status bitfield | `0x20` (bit 5) = commanded to run, moving in lockstep with reg 0. `0x04` (bit 2) = marks the 12-hourly pump sampling request. |
+| **2** | Status | `4` while the reg 0 no-flow flag (`0x2008`) is set, `0` otherwise. |
+| **25** | Command bitfield | bit 6 `0x40` = **water pump command**; bit 1 `0x02` = fan commanded; bit 10 `0x400` = set ~7 min into an anti-freeze heating run and held until it ends. Idle `0`, pump only `0x40` (64), running `0x42` (66), anti-freeze heating `0x442` (1090). Bit 6 was earlier read as "run demand"; it is the pump output, which is why it leads the fan and compressor bits on every start. |
 | **26** | Command bitfield | bit 5 `0x20` = fan commanded; bit 0 `0x01` = compressor commanded. Idle `0`, fan only `0x20` (32), running `0x21` (33). |
 | **30** | Static | 28 on this firmware. Did not move across a full stop/start cycle — despite the value, it is **not** a mirror of the 785 state echo. |
-| **33** | Unknown | Reads `-1` (`0xFFFF`) almost always, but takes the value **3** for five minutes during the standby self-check — so it is **not** an unpopulated sensor input, despite the resting value. Read as signed. |
+| **33** | Unknown | Reads `-1` (`0xFFFF`) normally, and **3** whenever the reg 0 no-flow flag is set — for five minutes, or for days when the flag latches. Not an unpopulated sensor input, despite the resting value. Read as signed. |
 | **34** | Probably unpopulated sensor input | Reads `-1` (`0xFFFF`) constantly, including through the self-check. Same convention as reg 81's -58 for the absent tank sensor. Read as signed. |
 | **36** | Static | 1. |
 | **39** | **Compressor demand frequency** | Hz. The control law's output — what the controller *wants*. Steps directly to the new target. |
@@ -135,7 +138,7 @@ The three together are the full inverter control chain: **39 demand → 40 ramp 
 
 ```
 +4.1   reg 0/1   -> 4096/32   demand set, 140s before anything moves
-+4.2   reg 25    -> 64        bit 6 run demand
++4.2   reg 25    -> 64        bit 6 pump command
 +108.8 reg 785 34 -> 35       enters startup dwell
 +124.1 reg 25 64 -> 66        bit 1 fan commanded
 +124.1 reg 26  0 -> 32        bit 5 fan commanded
@@ -155,39 +158,195 @@ describes.
 **Why regs 0 and 1 matter most.** They are single bits set in otherwise-empty
 16-bit words at the very bottom of the address space. That is the shape of a
 status/fault bitmap, and it is the most promising place yet found for the
-undecoded E-codes and the defrost flag. Bit 12 of reg 0 and bit 5 of reg 1 are
-now known to mean "run demand"; the remaining 30 bits are unmapped because
-this unit has not faulted.
+undecoded E-codes and the defrost flag. Reg 0 bits 1, 2, 3, 8, 12 and 13 and
+reg 1 bits 2 and 5 now have observed meanings (run demand, anti-freeze stages,
+no-flow); the remaining 24 bits are unmapped because this unit has not faulted.
 
-### Standby self-check (registers 0, 1, 2, 25, 33)
+### Sustained run: 13 hours, 2026-09-14
 
-With the unit powered off, compressor and pump idle, the controller runs a
-**five-minute routine** that briefly lights registers otherwise assumed dead.
-Captured twice on 2026-09-12, identical in sequence and timing:
+The longest continuous capture to date, and the only one that exercises the sensor
+registers across their full working range. One uninterrupted heat call, 06:47→19:59
+(13.19 h), water 73.4→86.7°F, ambient 60–70°F, 58.0 kWh at the meter. The compressor
+sat at 82 Hz — its maximum — for all but the first and last half hour, so this is a
+constant-speed sweep with only the lift changing.
+
+| hour | outlet °F | reg 71 cond | approach | evap SH | reg 66 EEV | reg 72 bus | reg 69 |
+|---|---|---|---|---|---|---|---|
+| 06:30* | 74.5 | 81.3 | 8.3 | 9.8 | 153 | 352.4 | 96 |
+| 07:00 | 78.8 | 95.9 | 16.9 | 2.4 | 178 | 378.3 | 195 |
+| 09:00 | 81.5 | 95.0 | 13.6 | 1.5 | 163 | 378.3 | 196 |
+| 11:00 | 83.9 | 94.7 | 10.8 | 1.3 | 152 | 378.3 | 198 |
+| 13:00 | 86.5 | 97.0 | 10.2 | 0.9 | 151 | 378.3 | 201 |
+| 15:00 | 88.5 | 97.6 | 9.2 | 1.0 | 149 | 378.3 | 192 |
+| 17:00 | 89.5 | 95.6 | 6.0 | ~0 | — | 378.3 | 208 |
+| 19:00 | 90.4 | 94.1 | 4.2 | ~0 | 285 | 377.9 | 208 |
+
+\* 06:30 row is the ramp-up bucket — compressor still climbing to speed, PFC not yet
+at its regulated value, superheat not yet pulled down.
+
+Four things this establishes:
+
+1. **Reg 72 is regulated, not merely "high while running."** 378.3 V held flat for
+   thirteen hours. Combined with the 332.6 V idle reading this is the strongest
+   confirmation yet that reg 72 is the PFC bus and not an energy accumulator.
+
+2. **Condensing temperature is pinned, and the approach collapses.** Reg 71 stayed
+   inside 94–97°F for the whole run while outlet water rose nearly 12°F beneath it.
+   The approach therefore fell 16.9→4.2°F. This is the unit's capacity wall: heat
+   transfer scales with that approach, so the water-temperature rise decayed from
+   ~1.4°F/h to ~0.2°F/h even though input power was constant. Practical ceiling for
+   this unit is condensing temperature minus a few degrees, i.e. low 90s°F.
+
+3. **The EEV regulates discharge temperature, not suction superheat.** Reg 66 closed
+   178→150 steps between 07:00 and 10:00 while discharge temperature climbed
+   170→185°F — and then both stopped moving. Across 10:00–19:00 discharge held
+   **183.3°F, sd 1.05** with the valve parked at 151 ± 2 steps. Discharge is the most
+   tightly regulated quantity in the machine, by coefficient of variation:
+
+   | quantity | CV over 10:00–19:00 |
+   |---|---|
+   | discharge temp | **0.57 %** |
+   | condensing temp | 1.32 % |
+   | ambient | 2.98 % |
+   | evaporator coil | 3.48 % |
+
+   That is the signature of a controller targeting discharge temperature: close the
+   valve until discharge reaches setpoint, then hold, and let suction superheat land
+   where it may. It makes engineering sense — discharge temperature is what damages a
+   compressor, and it is measurable with a cheap surface sensor, whereas true suction
+   superheat needs a pressure transducer this class of unit does not have. Liquid
+   return is handled by the suction accumulator instead. 183°F discharge against 96°F
+   condensing is healthy, and far too hot to be consistent with a flooded evaporator.
+   The valve reopens to 285 steps during the shutdown ramp.
+
+4. **Reg 69 rises with lift at constant speed.** Input current went 195→208 (×0.1 A)
+   across the run, consistent with the reg 69 = current decode: same compressor speed,
+   higher condensing pressure, more work. The trend is not monotonic — the 15:00 sample
+   dips to 192 — because the controller trims speed slightly against its own setpoint,
+   so this is a tendency across the run rather than a clean correlation.
+
+> [!WARNING]
+> **The derived "evaporator superheat" is unvalidated and probably is not superheat.**
+> It is computed as reg 77 − reg 75. Closing an EEV must *raise* true suction
+> superheat, yet across this run the valve closed 178→150 while the computed value
+> fell. Both cannot be true. The likely explanation is that reg 75 does not read
+> saturated evaporating temperature: if it sits at or near the evaporator outlet, or on
+> a return bend already in the superheated region, then coil ≈ suction by construction
+> and the 1–2°F difference is line pickup, not superheat. Consistent with that, reg 75
+> and reg 77 track within 1–2°F for the entire run and never diverge.
+>
+> Resolution compounds it — both registers are integer °F, so the difference carries
+> ±2°F and anything under ~2°F is indistinguishable from zero. **Do not read a small or
+> negative value as evidence of flooding.** Confirming what reg 75 actually measures
+> needs a gauge set: suction pressure gives the true saturation temperature. The same
+> caution applies to the derived condenser approach, which depends on reg 71.
+
+### Pump sampling cycle (registers 0, 1, 2, 25, 33)
+
+With the unit powered off, the controller asks for the water pump every
+**~12h05m** so it can sample the water temperature. First captured on
+2026-09-12 and read at the time as a "standby self-check"; the October
+anti-freeze events showed what it actually is. Identical sequence each time:
 
 | offset | change |
 |---|---|
-| +0s | reg 1 → 4, reg 25 → 64 |
-| +95s | reg 0 → 8200, reg 2 → 4 |
+| +0s | reg 1 → 4, reg 25 → 64 (bit 6: pump command) |
+| +95s | reg 0 → 8200 (`0x2008`), reg 2 → 4 — pump requested, no flow seen |
 | +100s | reg 33 → 3 |
 | +120s | reg 1 → 0 |
 | +145s | reg 25 → 0 |
 | +300s | reg 0 → 0, reg 2 → 0, reg 33 → -1 |
 
-Observed at 03:33:02Z and 15:38:48Z — 12h05m apart, so probably a fixed
-internal timer rather than anything tied to pump or heater state. Nothing
-starts: the compressor never turns, the pump is unaffected, and the protection
-bits stay at 1 throughout. Reg 25 bit 6 is the run-demand bit, asserted for two
-minutes without any demand being acted on, which is what suggests a self-check —
-plausibly the freeze-protection sampling these controllers run on a schedule.
+On this installation the controller's pump output is not wired to anything —
+the pool pump runs on its own schedule — so the request is never answered and
+the flow switch stays open (reg 29 = 511). The `0x2008` / reg 2 / reg 33
+pattern is the controller noticing that: it appears 95s after the pump command,
+and **it clears the instant flow is established**. Normally it times out after
+five minutes. During anti-freeze stage 1 it **latches**: on 2026-10-19 it set
+at 21:59 and stayed set for more than four days, through every 12-hourly
+cycle, until the compressor started and the pool pump came on.
 
 **Reg 2 appears nowhere else.** It reads 0 in every other condition logged,
 which is why earlier surveys of an idle machine listed it as empty.
 
+### Anti-freeze protection (registers 0, 25, 39, 40)
+
+Captured twice, 2026-10-19 and 2026-10-24, both with the unit **powered off**
+(reg 773 = 0, HA power switch off). Anti-freeze overrides the power state: the
+compressor runs regardless, and the power switch cannot stop it.
+
+**Stage 1 — reg 0 bit 1 (`0x0002`).** Set when the unit's ambient reading
+(reg 74) falls to about 42°F, cleared at about 44–46°F. While it is set the
+controller runs the pump **3 minutes on, 10 minutes off** (reg 25 bit 6, a
+~13m05s period). The intent is to keep warm pool water moving through the heat
+exchanger. With the pump output unwired, nothing moves, and the water standing
+in the unit cools towards ambient.
+
+**Stage 2 — reg 0 bit 2 (`0x0004`).** Set when the stagnant inlet water
+(reg 84) reached **38°F**, both times with ambient at 32–35°F. The controller
+then **starts the compressor without waiting for flow**:
+
+```
+2026-10-24 (unit off, ambient 32-34F, inlet 38F stagnant)
+03:50:12  reg 0  8202 -> 8206    stage 2 set
+03:52:12  reg 39/40 -> 42        demand
+03:52:16  reg 64 -> 30           compressor starts, reg 29 still 511 (no flow)
+03:52:16  pool pump on           HA watchdog automation, 70 ms later
+03:52:17  reg 29 -> 255          flow; reg 0 -> 6, no-flow flag clears
+03:55:57  reg 39 -> 60           demand steps to 60
+03:59:17  reg 0 -> 262, reg 25 -> 1090
+                                 bit 8 sets (demand 40), bit 10 sets
+04:16 on  reg 0 bit 8 toggles every ~95s; demand alternates 40/60, but
+          reg 40 holds 60 and the compressor stays at 60 Hz
+```
+
+Stage 2 does **not** end when the water warms. On 10-24 the inlet was reading
+48°F with flow from 03:52 onwards and the compressor kept running. On 10-19
+both bits cleared together at 08:58, when the unit's ambient reached 44°F
+(outdoor reference ~42–44°F). The exit appears to be stage 1 clearing, so the
+compressor runs until the **air** warms.
+
+**What the refrigerant circuit does in this mode:**
+
+| 2026-10-24 | 04:00 | 04:30 | 05:30 | 06:30 | 08:00 |
+|---|---|---|---|---|---|
+| ambient (reg 74) | 32 | 32 | 32 | 32 | 32 |
+| coil / suction (regs 75/77) | 22 | −9 | −21 | −24 | −26 |
+| discharge (reg 78) | 111 | 73 | 73 | 72 | 72 |
+| reg 71 | 44 | 32 | 33 | 35 | 35 |
+| inlet / outlet water | 48 / 50 | 48 / 50 | 48 / 50 | 48 / 50 | 48 / 50 |
+| EEV (reg 66) | 135 | 135 | 135 | 135 | 135 |
+| input current | 4.8 A | 7.7 A | 7.4 A | 7.4 A | 7.3 A |
+
+- The evaporator ran **58°F below the air** for hours, and the fan never
+  stopped, so either no defrost happened or this unit defrosts some other way.
+  The coil was probably icing.
+- Discharge settled at 72°F with the EEV fixed at 135 steps, instead of the
+  ~183°F it holds in normal heating. That is what a small pressure ratio
+  predicts (−26°F suction, condensing in the 30s), not evidence of liquid
+  return: discharge − reg 71 stayed around 37°F. **No protection tripped** —
+  regs 96/97/99 held 1 and no E-code fired — and the bit 8 demand cuts suggest
+  the controller was actively limiting. Read this as an inefficient mode, not
+  a damaging one.
+- Outlet − inlet stayed at +2°F, which is about the sensors' idle offset, so
+  little heat demonstrably reached the water for ~1.8 kVA in. Reg 71 at
+  33–35°F, below the water it is supposedly heating, is unexplained (see the
+  reg 71 row).
+- 10-19 looked the same over a shorter run: coil 22 → −17°F, discharge
+  120 → 77°F in 80 minutes.
+
+**Practical consequence: the pump must answer reg 25 bit 6.** Stage 2 only
+happened because stage 1's pump requests went unanswered and the water inside
+the unit went stagnant. With the pool at 48°F, circulating it through the unit
+would have kept the inlet well above 38°F. If the pool pump is not wired to the
+controller's pump output, have Home Assistant follow bit 6 instead — turn the
+pump on when it sets, and back off when it clears if Home Assistant was the
+one that started it.
+
 This is the clearest illustration of why the v1.4.0 continuous capture exists.
 Every earlier survey sampled a machine that was either idle or running steadily,
-and this routine is invisible in both — it needs something watching during the
-five minutes a day when it happens.
+and both of these behaviours are invisible in that — they need something
+watching when they happen.
 
 ### Protection status registers (96-99)
 
@@ -264,7 +423,7 @@ Ranges 0-59 and 786-800 were swept on 2026-09-10 with
 are in the command/status block above. The bus answered cleanly throughout —
 no Modbus exceptions — so these are real, implemented registers.
 
-Of the 60 registers in 0-59, **thirteen** are live: 0, 1, 2, 25, 26, 29, 30,
+Of the 60 registers in 0-59, **twelve** are live: 0, 1, 2, 25, 26, 29, 30,
 33, 34, 36, 39, 40. In 786-800, only 786 (constant 26). Everything else reads
 zero in every condition logged so far.
 
@@ -415,7 +574,9 @@ To find it, watch the diagnostic register dumps during a defrost event. Defrost 
 the cycle from the physical signature — compressor turning while the outdoor
 fan is stopped, heat mode only — without needing a register at all. In every
 run logged, the fan has never been at zero while the compressor turns, so the
-combination is unambiguous. When it fires, `Last Defrost` latches the
+combination is unambiguous. Note that it also never fired during the
+2026-10-24 anti-freeze run, with the coil at −26°F for four hours — either no
+defrost happened, or it does not stop the fan. When it fires, `Last Defrost` latches the
 compressor, fan, coil, ambient, suction, discharge and condensing
 temperatures, the EEV position, **and the full 0-59 register map**, and logs
 the lot at WARN.
