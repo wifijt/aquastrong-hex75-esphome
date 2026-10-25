@@ -279,12 +279,17 @@ which is why earlier surveys of an idle machine listed it as empty.
 
 ### Anti-freeze protection (registers 0, 25, 39, 40)
 
-Captured twice, 2026-10-19 and 2026-10-24, both with the unit **powered off**
-(reg 773 = 0, HA power switch off). Anti-freeze overrides the power state: the
-compressor runs regardless, and the power switch cannot stop it.
+Captured three times, all with the unit **powered off** (reg 773 = 0, HA power
+switch off). On 2026-10-19 and 2026-10-24 nothing answered the controller's
+pump requests and the unit escalated to stage 2. On the night of 2026-10-24/25
+Home Assistant followed the pump command, and it stayed in stage 1 (see
+[Stage 1 with the pump answered](#stage-1-with-the-pump-answered)).
+Anti-freeze overrides the power state: the compressor runs regardless, and the
+power switch cannot stop it.
 
 **Stage 1 — reg 0 bit 1 (`0x0002`).** Set when the unit's ambient reading
-(reg 74) falls to about 42°F, cleared at about 44–46°F. While it is set the
+(reg 74) falls below 42°F (on 10-24/25 it set 4 s after reg 74 first read
+41°F), cleared at about 44–46°F. While it is set the
 controller runs the pump **3 minutes on, 10 minutes off** (reg 25 bit 6, a
 ~13m05s period). The intent is to keep warm pool water moving through the heat
 exchanger. With the pump output unwired, nothing moves, and the water standing
@@ -350,6 +355,38 @@ would have kept the inlet well above 38°F. If the pool pump is not wired to the
 controller's pump output, have Home Assistant follow bit 6 instead — turn the
 pump on when it sets, and back off when it clears if Home Assistant was the
 one that started it.
+
+#### Stage 1 with the pump answered
+
+On the night of 2026-10-24/25 the unit was again powered off, and Home
+Assistant now followed bit 6. It turned the pool pump on when the bit set and
+off 30 s after it cleared (the `Pump Command` binary sensor driving an
+automation).
+
+```
+2026-10-24/25 (unit off, pump following reg 25 bit 6)
+21:44:55  bit 6 on, 2 min        12-hourly sampling cycle, not anti-freeze
+23:37:09  reg 0 bit 1 set        stage 1; reg 74 first read 41F at 23:37:05
+23:39:21  bit 6 on               first anti-freeze pump request, pump on 0.07 s later
+23:42:26  bit 6 off              pump off at 23:42:56 (30 s hold)
+23:52:26  bit 6 on               next cycle: 3 min on, ~10 min off, 13m05s period
+...       (41 requests up to 08:25; all answered, no-flow flag never set)
+08:30     stage 1 still set      ambient 39F, low of 34F before dawn
+```
+
+| | 10-24 (pump unanswered) | 10-24/25 (pump answered) |
+|---|---|---|
+| ambient low (reg 74) | 32°F | 34°F |
+| inlet water (reg 84) | fell to 38°F, standing | held 47–49°F |
+| stage 2 (reg 0 bit 2) | set at 03:50 | never set |
+| compressor | ~5.8 h, up to 60 Hz | 0 Hz all night |
+
+Circulating 48°F pool water through the unit for 3 minutes in every 13 was
+enough to keep the inlet ~9°F above the stage 2 trigger, on a night only 2°F
+warmer than the one that escalated. This confirms that stage 2 was a
+consequence of the unwired pump output, not a normal part of the cycle. The
+cost is pump cycling: about 4.5 starts an hour for as long as the air stays
+below the stage 1 exit.
 
 This is the clearest illustration of why the v1.4.0 continuous capture exists.
 Every earlier survey sampled a machine that was either idle or running steadily,
