@@ -279,25 +279,55 @@ which is why earlier surveys of an idle machine listed it as empty.
 
 ### Anti-freeze protection (registers 0, 25, 39, 40)
 
-Captured three times, all with the unit **powered off** (reg 773 = 0, HA power
+Captured four times, all with the unit **powered off** (reg 773 = 0, HA power
 switch off). On 2026-10-19 and 2026-10-24 nothing answered the controller's
-pump requests and the unit escalated to stage 2. On the night of 2026-10-24/25
-Home Assistant followed the pump command, and it stayed in stage 1 (see
-[Stage 1 with the pump answered](#stage-1-with-the-pump-answered)).
+pump requests and the unit escalated to stage 2. On the nights of 2026-10-24/25
+and 2026-10-25/26 Home Assistant followed the pump command, and it stayed in
+stage 1 (see [Stage 1 with the pump answered](#stage-1-with-the-pump-answered)).
 Anti-freeze overrides the power state: the compressor runs regardless, and the
 power switch cannot stop it.
 
-**Stage 1 — reg 0 bit 1 (`0x0002`).** Set when the unit's ambient reading
-(reg 74) falls below 42°F (on 10-24/25 it set 4 s after reg 74 first read
-41°F), cleared at about 44–46°F. While it is set the
+**Stage 1 — reg 0 bit 1 (`0x0002`).** Set when the unit's ambient (reg 74)
+falls to about **42°F**, cleared when it rises to about **45°F**. Reg 74 is
+reported in whole degrees, but the controller appears to compare a finer
+internal value, so the transitions land on the edges of the integer readings:
+
+| Event | bit 1 changed | reg 74 at that moment | Next reg 74 change |
+|---|---|---|---|
+| set, 10-24/25 | 23:37:09 | 41 (since 23:37:05) | 42 at 23:37:10 |
+| set, 10-25/26 | 02:56:21 | 42 | 41 at 02:57:17 |
+| clear, 10-24 | 09:39:27 | 44 (since 09:34:23) | 45 at 09:39:53 |
+| clear, 10-25 | 09:10:29 | 44 (since 09:03:00) | 45 at 09:10:45 |
+
+Read the thresholds as ~41.5–42°F to set and ~44.5–45°F to clear, a ~3°F
+hysteresis. Whether the controller also requires the reading to hold for a
+few minutes is not settled. While it is set the
 controller runs the pump **3 minutes on, 10 minutes off** (reg 25 bit 6, a
 ~13m05s period). The intent is to keep warm pool water moving through the heat
 exchanger. With the pump output unwired, nothing moves, and the water standing
 in the unit cools towards ambient.
 
-**Stage 2 — reg 0 bit 2 (`0x0004`).** Set when the stagnant inlet water
-(reg 84) reached **38°F**, both times with ambient at 32–35°F. The controller
-then **starts the compressor without waiting for flow**:
+**Stage 2 — reg 0 bit 2 (`0x0004`).** Both captures were with stagnant water
+and ambient at 32–35°F. The trigger is **not yet identified**. On 10-24 the
+inlet (reg 84) had been reading 38°F since about 01:01, nearly three hours
+before stage 2 set, so the inlet at 38°F is not the trigger on its own. Two
+readings crossed a new low in the minutes before it:
+
+| 2026-10-24 | First reached | Before stage 2 set (03:50:12) |
+|---|---|---|
+| inlet water (reg 84) | 38°F at ~01:01 | 2 h 49 min — ruled out alone |
+| coil (reg 75) | 36°F at 03:40:41 | ~9.5 min |
+| outlet water (reg 80) | 40°F at 03:45:46 | 4 min 26 s |
+| ambient (reg 74) | 33°F at 03:47:36 | 2 min 36 s |
+
+The candidates are **ambient at ~33°F** and **outlet water at ~40°F**, possibly
+with a confirmation delay. The outlet is the more conventional choice — it is
+the end of the heat exchanger and the part most at risk of freezing — but one
+event cannot separate them, and the 10-19 history is no longer available. A
+night with ambient at or below 33°F while the pump is circulating will settle
+it: if stage 2 still sets with the water in the 40s, the trigger is ambient.
+
+Once set, the controller **starts the compressor without waiting for flow**:
 
 ```
 2026-10-24 (unit off, ambient 32-34F, inlet 38F stagnant)
@@ -313,11 +343,25 @@ then **starts the compressor without waiting for flow**:
           reg 40 holds 60 and the compressor stays at 60 Hz
 ```
 
-Stage 2 does **not** end when the water warms. On 10-24 the inlet was reading
-48°F with flow from 03:52 onwards and the compressor kept running. On 10-19
-both bits cleared together at 08:58, when the unit's ambient reached 44°F
-(outdoor reference ~42–44°F). The exit appears to be stage 1 clearing, so the
-compressor runs until the **air** warms.
+Stage 2 is a **fixed-speed routine, not a water-temperature loop**. Once the
+initial ramp is done, reg 40 and the compressor hold 60 Hz whatever the water
+or coil does. Demand (reg 39) dips to 40 with bit 8, but the setpoint does not
+follow. It does **not** end when the water warms. On 10-24 the inlet was
+reading 48°F with flow from 03:52 onwards and the compressor kept running.
+Both bits clear together, on the stage 1 exit, so the compressor runs until
+the **air** warms:
+
+```
+2026-10-24 (outlet 49-50F throughout)
+09:34:23  reg 74 first reads 44F, then flickers 43/44
+09:39:27  reg 0  262 -> 256      bits 1 and 2 clear together
+09:39:33  compressor 60 -> 59 -> 52 -> 48 -> 44 -> 40 -> 0 Hz by 09:39:58
+09:39:53  reg 74 first reads 45F
+09:40:02  reg 0 -> 0
+```
+
+10-19 ended the same way, both bits clearing together at 08:58 with the
+unit's ambient at 44°F. The 10-24 run lasted 5 h 47 min.
 
 **What the refrigerant circuit does in this mode:**
 
@@ -348,45 +392,58 @@ compressor runs until the **air** warms.
 - 10-19 looked the same over a shorter run: coil 22 → −17°F, discharge
   120 → 77°F in 80 minutes.
 
-**Practical consequence: the pump must answer reg 25 bit 6.** Stage 2 only
-happened because stage 1's pump requests went unanswered and the water inside
-the unit went stagnant. With the pool at 48°F, circulating it through the unit
-would have kept the inlet well above 38°F. If the pool pump is not wired to the
+**Practical consequence: the pump must answer reg 25 bit 6.** Both stage 2
+runs followed hours of unanswered stage 1 pump requests, with the water inside
+the unit standing and cooling towards the air. If the trigger is the outlet
+water, circulating a 48°F pool would have prevented both. If it is ambient,
+circulation cannot prevent it, but it at least gives the compressor flow when
+it starts. Either way, if the pool pump is not wired to the
 controller's pump output, have Home Assistant follow bit 6 instead — turn the
 pump on when it sets, and back off when it clears if Home Assistant was the
 one that started it.
 
 #### Stage 1 with the pump answered
 
-On the night of 2026-10-24/25 the unit was again powered off, and Home
-Assistant now followed bit 6. It turned the pool pump on when the bit set and
-off 30 s after it cleared (the `Pump Command` binary sensor driving an
-automation).
+From 2026-10-24 the unit was again powered off, and Home Assistant followed
+bit 6. It turned the pool pump on when the bit set and off 30 s after it
+cleared (the `Pump Command` binary sensor driving an automation).
 
 ```
 2026-10-24/25 (unit off, pump following reg 25 bit 6)
 21:44:55  bit 6 on, 2 min        12-hourly sampling cycle, not anti-freeze
-23:37:09  reg 0 bit 1 set        stage 1; reg 74 first read 41F at 23:37:05
+23:37:09  reg 0 bit 1 set        stage 1
 23:39:21  bit 6 on               first anti-freeze pump request, pump on 0.07 s later
 23:42:26  bit 6 off              pump off at 23:42:56 (30 s hold)
 23:52:26  bit 6 on               next cycle: 3 min on, ~10 min off, 13m05s period
-...       (41 requests up to 08:25; all answered, no-flow flag never set)
-08:30     stage 1 still set      ambient 39F, low of 34F before dawn
+...       (all requests answered, no-flow flag never set; ambient low 34F)
+09:01:21  last pump request
+09:10:29  reg 0 bit 1 clears     9 h 33 min in stage 1
+
+2026-10-25/26
+21:08:17  bit 6 on, 2 min        12-hourly sampling cycle
+02:56:21  reg 0 bit 1 set        stage 1
+03:00:17  bit 6 on               first anti-freeze pump request
+...       (14 requests to 06:29, all answered; ambient low 41F)
 ```
 
-| | 10-24 (pump unanswered) | 10-24/25 (pump answered) |
-|---|---|---|
-| ambient low (reg 74) | 32°F | 34°F |
-| inlet water (reg 84) | fell to 38°F, standing | held 47–49°F |
-| stage 2 (reg 0 bit 2) | set at 03:50 | never set |
-| compressor | ~5.8 h, up to 60 Hz | 0 Hz all night |
+| | 10-24 (pump unanswered) | 10-24/25 (answered) | 10-25/26 (answered) |
+|---|---|---|---|
+| ambient low (reg 74) | 32°F | 34°F | 41°F |
+| water standing in the unit before pumping | 38°F | 47–49°F | 44°F |
+| inlet with circulation | 48°F | 47–49°F | 47–48°F |
+| stage 2 (reg 0 bit 2) | set at 03:50 | never set | never set |
+| compressor | 5 h 47 min, mostly 60 Hz | 0 Hz all night | 0 Hz all night |
 
-Circulating 48°F pool water through the unit for 3 minutes in every 13 was
-enough to keep the inlet ~9°F above the stage 2 trigger, on a night only 2°F
-warmer than the one that escalated. This confirms that stage 2 was a
-consequence of the unwired pump output, not a normal part of the cycle. The
-cost is pump cycling: about 4.5 starts an hour for as long as the air stays
-below the stage 1 exit.
+Circulating pool water through the unit for 3 minutes in every 13 kept the
+water in the unit within a couple of degrees of the pool, and stage 2 never
+set. This does **not** yet prove that circulation prevents stage 2. On
+10-24/25 the air bottomed out at 34°F, so it never reached the 33°F that
+preceded the 10-24 start, and the ambient-trigger candidate was never tested.
+The cost of answering the pump is cycling: about 4.5 starts an hour for as
+long as the air stays below the stage 1 exit. The pool itself is cooling — the
+water left standing in the unit read 44°F before pumping on 10-25/26 — so as
+it approaches 40°F, an outlet-water trigger would be reached even with the pump
+answered.
 
 This is the clearest illustration of why the v1.4.0 continuous capture exists.
 Every earlier survey sampled a machine that was either idle or running steadily,
