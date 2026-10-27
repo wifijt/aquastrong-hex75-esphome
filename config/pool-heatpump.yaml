@@ -323,8 +323,9 @@ text_sensor:
   #   Pump cycling - reg 0 bit 1, stage 1: ambient below ~42 F, pump asked
   #                  for 3 min on / 10 min off
   #   Heating      - reg 0 bit 2, stage 2: compressor running with the
-  #                  power switch off, seen when stagnant inlet water hit
-  #                  38 F; ends with stage 1, when the AIR warms
+  #                  power switch off, fixed 60 Hz. Trigger unresolved:
+  #                  ambient ~33 F or outlet water ~40 F (see PROTOCOL.md);
+  #                  ends with stage 1, when the AIR warms
   # Transitions are logged at WARN with the conditions and register map.
   - platform: template
     name: "Pool Heater Anti-Freeze Stage"
